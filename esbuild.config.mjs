@@ -2,7 +2,7 @@ import esbuild from 'esbuild';
 import path from 'path';
 import process from 'process';
 import os from 'os';
-import builtins from 'builtin-modules';
+import { builtinModules } from 'module';
 import { copyFileSync, existsSync, mkdirSync, readFileSync } from 'fs';
 
 if (existsSync('.env.local')) {
@@ -44,7 +44,7 @@ const ctx = await esbuild.context({
   entryPoints: ['src/main.ts'],
   bundle: true,
   plugins: [copyToObsidian],
-  external: ['obsidian', 'electron', ...builtins, ...builtins.map((m) => `node:${m}`)],
+  external: ['obsidian', 'electron', ...builtinModules, ...builtinModules.map((m) => `node:${m}`)],
   format: 'cjs',
   target: 'es2022',
   logLevel: 'info',
