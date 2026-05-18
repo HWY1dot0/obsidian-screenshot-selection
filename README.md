@@ -52,6 +52,10 @@ OBSIDIAN_VAULT=~/path/to/your/vault npm run build
 
 The build copies `main.js`, `manifest.json`, and `styles.css` to `<OBSIDIAN_VAULT>/.obsidian/plugins/screenshot-selection/`. Use `npm run dev` for watch mode.
 
+## Network usage
+
+This plugin makes no network requests of its own. It uses the `modern-screenshot` library, which — when rendering a selection that contains externally-hosted images (e.g. `<img src="https://...">`) — may have your browser fetch those images so they can be embedded in the capture. No data is sent to any third-party server by the plugin.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
