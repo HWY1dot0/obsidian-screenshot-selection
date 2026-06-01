@@ -1,12 +1,35 @@
-import { MarkdownView, Notice, Plugin } from 'obsidian';
+import { App, MarkdownView, Notice, Plugin, PluginSettingTab, Setting } from 'obsidian';
 import { domToBlob } from 'modern-screenshot';
 
 const PREVIEW_SELECTORS = '.markdown-preview-view, .markdown-reading-view, .cm-content';
 const MAX_CANVAS_HEIGHT = 30000;
 const IMAGE_TIMEOUT_MS = 3000;
 
+type WatermarkPosition = 'bottom-right' | 'bottom-left' | 'top-right' | 'top-left' | 'center';
+
+interface ScreenshotSelectionSettings {
+  watermarkEnabled: boolean;
+  watermarkText: string;
+  watermarkPosition: WatermarkPosition;
+  watermarkOpacity: number;
+  watermarkFontSize: number;
+}
+
+const DEFAULT_SETTINGS: ScreenshotSelectionSettings = {
+  watermarkEnabled: false,
+  watermarkText: 'Screenshot Selection',
+  watermarkPosition: 'bottom-right',
+  watermarkOpacity: 0.35,
+  watermarkFontSize: 14,
+};
+
 export default class ScreenshotSelectionPlugin extends Plugin {
+  settings: ScreenshotSelectionSettings = { ...DEFAULT_SETTINGS };
+
   async onload() {
+    await this.loadSettings();
+    this.addSettingTab(new ScreenshotSelectionSettingTab(this.app, this));
+
     this.addCommand({
       id: 'capture-selection-as-png',
       name: 'Screenshot selection to clipboard',
@@ -44,7 +67,7 @@ export default class ScreenshotSelectionPlugin extends Plugin {
         return;
       }
 
-      offscreen = buildOffscreen(range, previewRoot);
+      offscreen = buildOffscreen(range, previewRoot, this.settings);
       document.body.appendChild(offscreen);
 
       await waitForAssets(offscreen);
@@ -77,13 +100,25 @@ export default class ScreenshotSelectionPlugin extends Plugin {
       offscreen?.remove();
     }
   }
+
+  async loadSettings() {
+    this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+  }
+
+  async saveSettings() {
+    await this.saveData(this.settings);
+  }
 }
 
 function nodeAsElement(node: Node): Element | null {
   return node.nodeType === Node.ELEMENT_NODE ? (node as Element) : node.parentElement;
 }
 
-function buildOffscreen(range: Range, previewRoot: Element): HTMLDivElement {
+function buildOffscreen(
+  range: Range,
+  previewRoot: Element,
+  settings: ScreenshotSelectionSettings,
+): HTMLDivElement {
   const wrap = document.createElement('div');
   wrap.style.cssText = [
     'position: fixed',
@@ -100,6 +135,7 @@ function buildOffscreen(range: Range, previewRoot: Element): HTMLDivElement {
     'font-family: var(--font-text)',
     'font-size: var(--font-text-size)',
     'line-height: var(--line-height-normal)',
+    'overflow: hidden',
   ].join(';');
 
   const inner = document.createElement('div');
@@ -116,7 +152,59 @@ function buildOffscreen(range: Range, previewRoot: Element): HTMLDivElement {
   inner.appendChild(fix);
 
   wrap.appendChild(inner);
+  appendWatermark(wrap, settings);
   return wrap;
+}
+
+function appendWatermark(wrap: HTMLDivElement, settings: ScreenshotSelectionSettings) {
+  const text = settings.watermarkText.trim();
+  if (!settings.watermarkEnabled || !text) return;
+
+  const watermark = document.createElement('div');
+  watermark.textContent = text;
+  watermark.style.cssText = [
+    'position: absolute',
+    ...watermarkPositionStyles(settings.watermarkPosition),
+    'z-index: 1',
+    'max-width: calc(100% - 64px)',
+    'box-sizing: border-box',
+    'pointer-events: none',
+    'color: var(--text-muted)',
+    'background: color-mix(in srgb, var(--background-primary) 72%, transparent)',
+    'border: 1px solid color-mix(in srgb, var(--text-muted) 25%, transparent)',
+    'border-radius: 6px',
+    'padding: 4px 8px',
+    `font-size: ${clamp(settings.watermarkFontSize, 10, 32)}px`,
+    'font-family: var(--font-interface)',
+    'font-weight: 500',
+    'line-height: 1.3',
+    'white-space: nowrap',
+    'overflow: hidden',
+    'text-overflow: ellipsis',
+    `opacity: ${clamp(settings.watermarkOpacity, 0.1, 1)}`,
+  ].join(';');
+
+  wrap.appendChild(watermark);
+}
+
+function watermarkPositionStyles(position: WatermarkPosition): string[] {
+  switch (position) {
+    case 'bottom-left':
+      return ['left: 16px', 'bottom: 16px'];
+    case 'top-right':
+      return ['right: 16px', 'top: 16px'];
+    case 'top-left':
+      return ['left: 16px', 'top: 16px'];
+    case 'center':
+      return ['left: 50%', 'top: 50%', 'transform: translate(-50%, -50%)'];
+    case 'bottom-right':
+    default:
+      return ['right: 16px', 'bottom: 16px'];
+  }
+}
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
 }
 
 async function waitForAssets(root: HTMLElement): Promise<void> {
@@ -151,4 +239,87 @@ async function writeBlobToClipboard(blob: Blob): Promise<void> {
   }
   const buf = Buffer.from(await blob.arrayBuffer());
   electron.clipboard.writeImage(electron.nativeImage.createFromBuffer(buf));
+}
+
+class ScreenshotSelectionSettingTab extends PluginSettingTab {
+  plugin: ScreenshotSelectionPlugin;
+
+  constructor(app: App, plugin: ScreenshotSelectionPlugin) {
+    super(app, plugin);
+    this.plugin = plugin;
+  }
+
+  display(): void {
+    const { containerEl } = this;
+    containerEl.empty();
+
+    new Setting(containerEl)
+      .setName('Watermark')
+      .setDesc('Add a text watermark to captured images.')
+      .addToggle((toggle) =>
+        toggle.setValue(this.plugin.settings.watermarkEnabled).onChange(async (value) => {
+          this.plugin.settings.watermarkEnabled = value;
+          await this.plugin.saveSettings();
+        }),
+      );
+
+    new Setting(containerEl)
+      .setName('Watermark text')
+      .setDesc('Shown only when watermark is enabled.')
+      .addText((text) =>
+        text
+          .setPlaceholder('Screenshot Selection')
+          .setValue(this.plugin.settings.watermarkText)
+          .onChange(async (value) => {
+            this.plugin.settings.watermarkText = value;
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(containerEl)
+      .setName('Watermark position')
+      .addDropdown((dropdown) =>
+        dropdown
+          .addOptions({
+            'bottom-right': 'Bottom right',
+            'bottom-left': 'Bottom left',
+            'top-right': 'Top right',
+            'top-left': 'Top left',
+            center: 'Center',
+          })
+          .setValue(this.plugin.settings.watermarkPosition)
+          .onChange(async (value) => {
+            this.plugin.settings.watermarkPosition = value as WatermarkPosition;
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(containerEl)
+      .setName('Watermark opacity')
+      .setDesc('Lower values make the watermark more subtle.')
+      .addSlider((slider) =>
+        slider
+          .setLimits(0.1, 1, 0.05)
+          .setDynamicTooltip()
+          .setValue(this.plugin.settings.watermarkOpacity)
+          .onChange(async (value) => {
+            this.plugin.settings.watermarkOpacity = value;
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(containerEl)
+      .setName('Watermark font size')
+      .setDesc('Measured in pixels.')
+      .addSlider((slider) =>
+        slider
+          .setLimits(10, 32, 1)
+          .setDynamicTooltip()
+          .setValue(this.plugin.settings.watermarkFontSize)
+          .onChange(async (value) => {
+            this.plugin.settings.watermarkFontSize = value;
+            await this.plugin.saveSettings();
+          }),
+      );
+  }
 }
