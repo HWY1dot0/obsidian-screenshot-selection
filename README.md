@@ -9,6 +9,7 @@ The image inherits your current Obsidian theme (fonts, colors, callouts, code hi
 - Works in Reading View and Live Preview
 - Captures the full selection, even if it scrolls beyond the viewport
 - Preserves theme styling — dark / light, custom fonts, callouts, code blocks
+- Optional text watermark with configurable position, opacity, and font size
 - Output goes straight to the system clipboard — no save dialog, no file management
 - Desktop only (clipboard image write is unreliable on mobile Obsidian)
 
@@ -34,6 +35,10 @@ The image inherits your current Obsidian theme (fonts, colors, callouts, code hi
 4. Paste (`Cmd-V` / `Ctrl-V`) into any app that accepts images
 
 Assign a hotkey via Settings → Hotkeys for one-keystroke capture.
+
+### Watermark
+
+Open Settings → Screenshot Selection to enable a text watermark. You can customize the text, position, opacity, and font size. Watermarks are disabled by default, so existing captures keep the same clean output until you turn the option on.
 
 ## Known limits
 
