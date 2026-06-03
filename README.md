@@ -10,6 +10,7 @@ The image inherits your current Obsidian theme (fonts, colors, callouts, code hi
 - Captures the full selection, even if it scrolls beyond the viewport
 - Preserves theme styling — dark / light, custom fonts, callouts, code blocks
 - Output goes straight to the system clipboard — no save dialog, no file management
+- Optional watermark — a corner label or a diagonal tiled overlay
 - Desktop only (clipboard image write is unreliable on mobile Obsidian)
 
 ## Install
@@ -34,6 +35,17 @@ The image inherits your current Obsidian theme (fonts, colors, callouts, code hi
 4. Paste (`Cmd-V` / `Ctrl-V`) into any app that accepts images
 
 Assign a hotkey via Settings → Hotkeys for one-keystroke capture.
+
+## Watermark (optional)
+
+Off by default. To brand or protect your screenshots, enable a watermark in **Settings → Screenshot Selection**:
+
+- **Style** — *Corner label* (a short line in the corner you choose) or *Diagonal tiled* (repeated text across the whole image)
+- **Text** — any string, e.g. your handle
+- **Opacity** — `0`–`1`; a corner label looks good around `0.5`, a tiled overlay around `0.1`
+- **Font size**, and **color** (leave blank to use the theme's muted text color)
+
+The watermark is drawn onto the image at capture time, so it stays on the PNG you paste.
 
 ## Known limits
 
