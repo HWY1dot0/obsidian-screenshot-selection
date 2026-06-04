@@ -76,8 +76,23 @@ const DEFAULT_SETTINGS: PluginSettings = {
 export default class ScreenshotSelectionPlugin extends Plugin {
   settings!: PluginSettings;
 
+  // Last non-collapsed selection inside a rendered note, stashed continuously so
+  // capture survives the selection loss when a menu/ribbon is tapped on mobile.
+  // Cloning this LIVE DOM is what makes iOS rasterize correctly — a freshly
+  // MarkdownRenderer-rendered offscreen subtree comes back blank.
+  private lastPreviewRange: Range | null = null;
+
   async onload() {
     await this.loadSettings();
+
+    this.registerDomEvent(document, 'selectionchange', () => {
+      const sel = window.getSelection();
+      if (!sel || sel.rangeCount === 0 || sel.isCollapsed) return;
+      const range = sel.getRangeAt(0);
+      if (nodeAsElement(range.commonAncestorContainer)?.closest(PREVIEW_SELECTORS)) {
+        this.lastPreviewRange = range.cloneRange();
+      }
+    });
 
     this.addCommand({
       id: 'capture-selection-as-png',
@@ -120,11 +135,17 @@ export default class ScreenshotSelectionPlugin extends Plugin {
                 new Notice('Open a markdown note first');
                 return;
               }
-              if (snapshot) {
-                void this.captureMarkdownSnapshot(view, snapshot, Platform.isMobile ? 'auto' : 'file');
+              // On mobile go through capture() so the live-DOM clone path runs;
+              // the markdown snapshot re-renders and rasterizes blank on iOS.
+              if (Platform.isMobile) {
+                void this.capture(view, 'auto');
                 return;
               }
-              void this.capture(view, Platform.isMobile ? 'auto' : 'file');
+              if (snapshot) {
+                void this.captureMarkdownSnapshot(view, snapshot, 'file');
+                return;
+              }
+              void this.capture(view, 'file');
             });
         });
       }),
@@ -146,6 +167,19 @@ export default class ScreenshotSelectionPlugin extends Plugin {
 
   async saveSettings() {
     await this.saveData(this.settings);
+  }
+
+  // Current selection if it is live and inside a note, otherwise the last one
+  // stashed before a tap collapsed it.
+  getEffectiveSelectionRange(): Range | null {
+    const sel = window.getSelection();
+    if (sel && sel.rangeCount > 0 && !sel.isCollapsed) {
+      const range = sel.getRangeAt(0);
+      if (nodeAsElement(range.commonAncestorContainer)?.closest(PREVIEW_SELECTORS)) {
+        return range;
+      }
+    }
+    return this.lastPreviewRange;
   }
 
   private async captureActive(output: CaptureOutput) {
@@ -300,11 +334,21 @@ export default class ScreenshotSelectionPlugin extends Plugin {
 
 async function buildFileSource(plugin: ScreenshotSelectionPlugin, view: MarkdownView): Promise<CaptureSource | null> {
   if (Platform.isMobile) {
+    // Prefer a clone of the LIVE rendered DOM (Reading view / Live Preview). iOS
+    // WKWebView rasterizes already-painted nodes correctly; a freshly
+    // MarkdownRenderer-rendered offscreen subtree comes back blank (the
+    // 0.2.3–0.2.7 regression). Use the stashed range so a tap that drops the
+    // selection does not drop the capture.
+    const range = plugin.getEffectiveSelectionRange();
+    if (range) {
+      const domSource = buildRangeSource(range, true);
+      if (domSource) return domSource;
+    }
+
+    // Fallbacks re-render markdown (may be blank on iOS → text-canvas fallback
+    // downstream): explicit editor selection, then the current block.
     const editorSelectionSource = await buildEditorMarkdownSource(plugin, view, true);
     if (editorSelectionSource) return editorSelectionSource;
-
-    const selectionSource = buildDomSelectionSource(view, true, true);
-    if (selectionSource) return selectionSource;
 
     const editorSource = await buildEditorMarkdownSource(plugin, view);
     if (editorSource) return editorSource;
@@ -372,6 +416,17 @@ function getEditorMarkdownSnapshot(
     markdown: block.markdown,
     sourcePath,
     insertAfter: block.end,
+  };
+}
+
+// Build a capture source from an explicit DOM range (a clone of live, already
+// rendered note content). This is the path that rasterizes correctly on iOS.
+function buildRangeSource(range: Range, mobile: boolean): CaptureSource | null {
+  const anchor = nodeAsElement(range.commonAncestorContainer);
+  if (!anchor?.closest(PREVIEW_SELECTORS)) return null;
+  return {
+    offscreen: buildSelectionOffscreen(range, mobile),
+    fallbackMarkdown: range.toString().replace(/\n{3,}/g, '\n\n').trim(),
   };
 }
 
@@ -691,38 +746,43 @@ function isCanvasBlank(canvas: HTMLCanvasElement): boolean {
   const h = canvas.height;
   if (w === 0 || h === 0) return true;
 
-  const sw = Math.max(1, Math.min(96, w));
-  const sh = Math.max(1, Math.min(96, h));
-  const sample = document.createElement('canvas');
-  sample.width = sw;
-  sample.height = sh;
-  const ctx = sample.getContext('2d', { willReadFrequently: true });
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
   if (!ctx) return false; // cannot inspect → assume real content, keep the render
 
-  ctx.drawImage(canvas, 0, 0, sw, sh);
-
-  let data: Uint8ClampedArray;
+  let ref: Uint8ClampedArray;
   try {
-    data = ctx.getImageData(0, 0, sw, sh).data;
+    ref = ctx.getImageData(0, 0, 1, 1).data; // corner = wrap padding = background
   } catch {
     return false; // tainted/unreadable → keep the render
   }
+  const tol = 12;
 
-  const r0 = data[0];
-  const g0 = data[1];
-  const b0 = data[2];
-  const a0 = data[3];
-  const tol = 10;
-  for (let i = 0; i < data.length; i += 4) {
-    const a = data[i + 3];
-    if (Math.abs(a - a0) > tol) return false; // alpha differs from corner → content
-    if (a < 8) continue; // both effectively transparent
-    if (
-      Math.abs(data[i] - r0) > tol ||
-      Math.abs(data[i + 1] - g0) > tol ||
-      Math.abs(data[i + 2] - b0) > tol
-    ) {
-      return false; // a pixel differs from the background → real content
+  // Scan at FULL resolution in horizontal stripes, exiting on the first pixel
+  // that differs from the background. (An earlier version downscaled the whole
+  // canvas, which averaged thin text into near-background grey and wrongly
+  // reported real captures as blank — that bypassed the good render and forced
+  // the text fallback.) Content sits near the top, so the common case exits in
+  // the first stripe; only a genuinely uniform canvas scans far.
+  const stripeRows = 64;
+  for (let y = 0; y < h; y += stripeRows) {
+    const rows = Math.min(stripeRows, h - y);
+    let data: Uint8ClampedArray;
+    try {
+      data = ctx.getImageData(0, y, w, rows).data;
+    } catch {
+      return false;
+    }
+    for (let i = 0; i < data.length; i += 4) {
+      const a = data[i + 3];
+      if (Math.abs(a - ref[3]) > tol) return false;
+      if (a < 8) continue; // transparent like the background
+      if (
+        Math.abs(data[i] - ref[0]) > tol ||
+        Math.abs(data[i + 1] - ref[1]) > tol ||
+        Math.abs(data[i + 2] - ref[2]) > tol
+      ) {
+        return false; // a pixel differs from the background → real content
+      }
     }
   }
   return true;
