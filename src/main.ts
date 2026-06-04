@@ -39,6 +39,12 @@ interface CaptureResult {
   insertAfter?: EditorPosition;
 }
 
+interface MarkdownCaptureSnapshot {
+  markdown: string;
+  sourcePath: string;
+  insertAfter?: EditorPosition;
+}
+
 interface WatermarkSettings {
   enabled: boolean;
   text: string;
@@ -95,16 +101,25 @@ export default class ScreenshotSelectionPlugin extends Plugin {
 
     this.registerEvent(
       this.app.workspace.on('editor-menu', (menu, _editor, info) => {
+        const viewAtMenuOpen = info instanceof MarkdownView
+          ? info
+          : this.app.workspace.getActiveViewOfType(MarkdownView);
+        const snapshot = viewAtMenuOpen
+          ? getEditorMarkdownSnapshot(_editor, viewAtMenuOpen.file?.path ?? '')
+          : null;
+
         menu.addItem((item) => {
           item
             .setTitle(Platform.isMobile ? 'Screenshot selection/block' : 'Screenshot selection/block to file')
             .setIcon('camera')
             .onClick(() => {
-              const view = info instanceof MarkdownView
-                ? info
-                : this.app.workspace.getActiveViewOfType(MarkdownView);
+              const view = viewAtMenuOpen ?? this.app.workspace.getActiveViewOfType(MarkdownView);
               if (!view) {
                 new Notice('Open a markdown note first');
+                return;
+              }
+              if (snapshot) {
+                void this.captureMarkdownSnapshot(view, snapshot, Platform.isMobile ? 'auto' : 'file');
                 return;
               }
               void this.capture(view, Platform.isMobile ? 'auto' : 'file');
@@ -142,17 +157,43 @@ export default class ScreenshotSelectionPlugin extends Plugin {
   }
 
   private async capture(view: MarkdownView, output: CaptureOutput) {
+    const sourcePromise = output === 'clipboard'
+      ? Promise.resolve(buildDomSelectionSource(view, Platform.isMobile))
+      : buildFileSource(this, view);
+
+    await this.captureFromSource(view, sourcePromise, output);
+  }
+
+  private async captureMarkdownSnapshot(
+    view: MarkdownView,
+    snapshot: MarkdownCaptureSnapshot,
+    output: CaptureOutput,
+  ) {
+    await this.captureFromSource(
+      view,
+      buildSnapshotSource(this, snapshot, Platform.isMobile),
+      output,
+    );
+  }
+
+  private async captureFromSource(
+    view: MarkdownView,
+    sourcePromise: Promise<CaptureSource | null>,
+    output: CaptureOutput,
+  ) {
     if (output === 'auto') {
-      await this.captureAuto(view);
+      await this.captureAutoFromSource(view, sourcePromise);
       return;
     }
 
     try {
-      const result = await this.createCaptureResult(view, output);
-      if (!result) {
+      const source = await sourcePromise;
+      if (!source) {
         new Notice(output === 'file' ? 'No note content to capture' : 'No content selected');
         return;
       }
+
+      const result = await this.createCaptureResultFromSource(source);
 
       if (output === 'clipboard') {
         await writeBlobToClipboard(result.blob);
@@ -166,11 +207,13 @@ export default class ScreenshotSelectionPlugin extends Plugin {
     }
   }
 
-  private async captureAuto(view: MarkdownView) {
+  private async captureAutoFromSource(view: MarkdownView, sourcePromise: Promise<CaptureSource | null>) {
     const progress = new Notice('Capturing screenshot...', 0);
-    const resultPromise = this.createCaptureResult(view, 'file');
+    const resultPromise = sourcePromise.then((source) => {
+      if (!source) throw new Error('No note content to capture');
+      return this.createCaptureResultFromSource(source);
+    });
     const blobPromise = resultPromise.then((result) => {
-      if (!result) throw new Error('No note content to capture');
       return result.blob;
     });
 
@@ -185,11 +228,6 @@ export default class ScreenshotSelectionPlugin extends Plugin {
 
     try {
       const result = await resultPromise;
-      if (!result) {
-        new Notice('No note content to capture');
-        return;
-      }
-
       await this.saveCaptureResult(view, result, 'Copied failed; saved screenshot and inserted link');
     } catch (e) {
       showCaptureError(e);
@@ -198,14 +236,8 @@ export default class ScreenshotSelectionPlugin extends Plugin {
     }
   }
 
-  private async createCaptureResult(view: MarkdownView, output: CaptureOutput): Promise<CaptureResult | null> {
+  private async createCaptureResultFromSource(source: CaptureSource): Promise<CaptureResult> {
     let offscreen: HTMLDivElement | null = null;
-
-    const source = output === 'clipboard'
-      ? buildDomSelectionSource(view, Platform.isMobile)
-      : await buildFileSource(this, view);
-
-    if (!source) return null;
 
     try {
       offscreen = source.offscreen;
@@ -250,7 +282,7 @@ export default class ScreenshotSelectionPlugin extends Plugin {
 }
 
 async function buildFileSource(plugin: ScreenshotSelectionPlugin, view: MarkdownView): Promise<CaptureSource | null> {
-  if (view.getMode() === 'source') {
+  if (Platform.isMobile || view.getMode() === 'source') {
     const editorSource = await buildEditorMarkdownSource(plugin, view);
     if (editorSource) return editorSource;
   }
@@ -267,11 +299,29 @@ async function buildEditorMarkdownSource(plugin: ScreenshotSelectionPlugin, view
   const editor = view.editor;
   if (!editor) return null;
 
-  const sourcePath = view.file?.path ?? '';
+  const snapshot = getEditorMarkdownSnapshot(editor, view.file?.path ?? '');
+  if (!snapshot) return null;
+
+  return buildSnapshotSource(plugin, snapshot, Platform.isMobile);
+}
+
+async function buildSnapshotSource(
+  plugin: ScreenshotSelectionPlugin,
+  snapshot: MarkdownCaptureSnapshot,
+  mobile: boolean,
+): Promise<CaptureSource> {
+  return {
+    offscreen: await buildMarkdownOffscreen(plugin, snapshot.markdown, snapshot.sourcePath, mobile),
+    insertAfter: snapshot.insertAfter,
+  };
+}
+
+function getEditorMarkdownSnapshot(editor: Editor, sourcePath: string): MarkdownCaptureSnapshot | null {
   const selectedMarkdown = editor.getSelection();
   if (selectedMarkdown.trim()) {
     return {
-      offscreen: await buildMarkdownOffscreen(plugin, selectedMarkdown, sourcePath, Platform.isMobile),
+      markdown: selectedMarkdown,
+      sourcePath,
       insertAfter: editor.getCursor('to'),
     };
   }
@@ -280,7 +330,8 @@ async function buildEditorMarkdownSource(plugin: ScreenshotSelectionPlugin, view
   if (!block?.markdown.trim()) return null;
 
   return {
-    offscreen: await buildMarkdownOffscreen(plugin, block.markdown, sourcePath, Platform.isMobile),
+    markdown: block.markdown,
+    sourcePath,
     insertAfter: block.end,
   };
 }
@@ -341,10 +392,11 @@ async function buildMarkdownOffscreen(
 function getCurrentMarkdownBlock(editor: Editor): { markdown: string; end: EditorPosition } | null {
   const cursor = editor.getCursor();
   const lastLine = editor.lastLine();
-  let startLine = cursor.line;
-  let endLine = cursor.line;
+  const focusLine = getNearestNonEmptyLine(editor, cursor.line);
+  if (focusLine === null) return null;
 
-  if (!editor.getLine(cursor.line).trim()) return null;
+  let startLine = focusLine;
+  let endLine = focusLine;
 
   while (startLine > 0 && editor.getLine(startLine - 1).trim()) {
     startLine -= 1;
@@ -363,6 +415,22 @@ function getCurrentMarkdownBlock(editor: Editor): { markdown: string; end: Edito
     markdown: editor.getRange({ line: startLine, ch: 0 }, end),
     end,
   };
+}
+
+function getNearestNonEmptyLine(editor: Editor, line: number): number | null {
+  if (editor.getLine(line).trim()) return line;
+
+  const lastLine = editor.lastLine();
+  const maxDistance = Math.min(4, Math.max(line, lastLine - line));
+  for (let distance = 1; distance <= maxDistance; distance += 1) {
+    const before = line - distance;
+    if (before >= 0 && editor.getLine(before).trim()) return before;
+
+    const after = line + distance;
+    if (after <= lastLine && editor.getLine(after).trim()) return after;
+  }
+
+  return null;
 }
 
 function nodeAsElement(node: Node): Element | null {
