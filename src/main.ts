@@ -284,7 +284,20 @@ export default class ScreenshotSelectionPlugin extends Plugin {
 }
 
 async function buildFileSource(plugin: ScreenshotSelectionPlugin, view: MarkdownView): Promise<CaptureSource | null> {
-  if (Platform.isMobile || view.getMode() === 'source') {
+  if (Platform.isMobile) {
+    const editorSelectionSource = await buildEditorMarkdownSource(plugin, view, true);
+    if (editorSelectionSource) return editorSelectionSource;
+
+    const selectionSource = buildDomSelectionSource(view, true, true);
+    if (selectionSource) return selectionSource;
+
+    const editorSource = await buildEditorMarkdownSource(plugin, view);
+    if (editorSource) return editorSource;
+
+    return null;
+  }
+
+  if (view.getMode() === 'source') {
     const editorSource = await buildEditorMarkdownSource(plugin, view);
     if (editorSource) return editorSource;
   }
@@ -292,16 +305,18 @@ async function buildFileSource(plugin: ScreenshotSelectionPlugin, view: Markdown
   const selectionSource = buildDomSelectionSource(view, Platform.isMobile, true);
   if (selectionSource) return selectionSource;
 
-  if (Platform.isMobile) return null;
-
   return buildVisibleViewSource(view, Platform.isMobile);
 }
 
-async function buildEditorMarkdownSource(plugin: ScreenshotSelectionPlugin, view: MarkdownView): Promise<CaptureSource | null> {
+async function buildEditorMarkdownSource(
+  plugin: ScreenshotSelectionPlugin,
+  view: MarkdownView,
+  selectionOnly = false,
+): Promise<CaptureSource | null> {
   const editor = view.editor;
   if (!editor) return null;
 
-  const snapshot = getEditorMarkdownSnapshot(editor, view.file?.path ?? '');
+  const snapshot = getEditorMarkdownSnapshot(editor, view.file?.path ?? '', selectionOnly);
   if (!snapshot) return null;
 
   return buildSnapshotSource(plugin, snapshot, Platform.isMobile);
@@ -319,7 +334,11 @@ async function buildSnapshotSource(
   };
 }
 
-function getEditorMarkdownSnapshot(editor: Editor, sourcePath: string): MarkdownCaptureSnapshot | null {
+function getEditorMarkdownSnapshot(
+  editor: Editor,
+  sourcePath: string,
+  selectionOnly = false,
+): MarkdownCaptureSnapshot | null {
   const selectedMarkdown = editor.getSelection();
   if (selectedMarkdown.trim()) {
     return {
@@ -328,6 +347,8 @@ function getEditorMarkdownSnapshot(editor: Editor, sourcePath: string): Markdown
       insertAfter: editor.getCursor('to'),
     };
   }
+
+  if (selectionOnly) return null;
 
   const block = getCurrentMarkdownBlock(editor);
   if (!block?.markdown.trim()) return null;
@@ -358,9 +379,11 @@ function buildDomSelectionSource(view: MarkdownView, mobile: boolean, quiet = fa
     return null;
   }
 
+  const fallbackMarkdown = range.toString().replace(/\n{3,}/g, '\n\n').trim();
+
   return {
     offscreen: buildSelectionOffscreen(range, mobile),
-    fallbackMarkdown: range.toString(),
+    fallbackMarkdown,
   };
 }
 
