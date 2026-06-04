@@ -13,6 +13,7 @@ The image inherits your current Obsidian theme (fonts, colors, callouts, code hi
 - Mobile output tries the clipboard first, then saves to `Attachments/Screenshots/` if iOS rejects clipboard image writing
 - Mobile can capture the current markdown block without requiring precise touch selection
 - Mobile capture is limited to selected text or the current block to avoid slow, oversized whole-page captures
+- Mobile uses a canvas fallback renderer to avoid blank DOM screenshots in iOS WebView
 - Editor-menu capture snapshots the selection before iOS can collapse it
 - Adds a camera ribbon action and editor context-menu item for faster capture
 - Optional watermark — a corner label or a diagonal tiled overlay
