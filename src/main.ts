@@ -209,26 +209,22 @@ export default class ScreenshotSelectionPlugin extends Plugin {
 
   private async captureAutoFromSource(view: MarkdownView, sourcePromise: Promise<CaptureSource | null>) {
     const progress = new Notice('Capturing screenshot...', 0);
-    const resultPromise = sourcePromise.then((source) => {
-      if (!source) throw new Error('No note content to capture');
-      return this.createCaptureResultFromSource(source);
-    });
-    const blobPromise = resultPromise.then((result) => {
-      return result.blob;
-    });
 
     try {
-      await writeBlobPromiseToClipboard(blobPromise);
-      progress.hide();
-      new Notice('Copied screenshot to clipboard', 2000);
-      return;
-    } catch (e) {
-      console.warn('[screenshot-selection] mobile clipboard write failed, saving to vault', e);
-    }
+      const source = await sourcePromise;
+      if (!source) {
+        new Notice('No note content to capture');
+        return;
+      }
 
-    try {
-      const result = await resultPromise;
-      await this.saveCaptureResult(view, result, 'Copied failed; saved screenshot and inserted link');
+      const result = await this.createCaptureResultFromSource(source);
+      try {
+        await writeBlobToClipboard(result.blob);
+        new Notice('Copied screenshot to clipboard', 2000);
+      } catch (e) {
+        console.warn('[screenshot-selection] mobile clipboard write failed, saving to vault', e);
+        await this.saveCaptureResult(view, result, 'Copy failed; saved screenshot and inserted link');
+      }
     } catch (e) {
       showCaptureError(e);
     } finally {
@@ -244,7 +240,7 @@ export default class ScreenshotSelectionPlugin extends Plugin {
       document.body.appendChild(offscreen);
 
       await waitForAssets(offscreen);
-      await nextAnimationFrame();
+      await waitForPaint();
       if (!Platform.isMobile) {
         trimOffscreenToContent(offscreen);
       }
@@ -445,9 +441,9 @@ function createCaptureWrap(mobile: boolean): HTMLDivElement {
   wrap.className = 'screenshot-selection-capture';
   wrap.style.cssText = [
     'position: fixed',
-    `left: ${mobile ? '0' : '-10000px'}`,
-    `top: ${mobile ? '0' : '0'}`,
-    `z-index: ${mobile ? '-1' : '-1'}`,
+    `left: ${mobile ? '8px' : '-10000px'}`,
+    `top: ${mobile ? 'calc(env(safe-area-inset-top, 0px) + 8px)' : '0'}`,
+    `z-index: ${mobile ? '2147483647' : '-1'}`,
     'pointer-events: none',
     'height: auto',
     `width: ${mobile ? 'min(390px, calc(100vw - 32px))' : 'var(--file-line-width, 760px)'}`,
@@ -570,6 +566,13 @@ function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T | null> {
     promise,
     new Promise<null>((resolve) => setTimeout(() => resolve(null), ms)),
   ]);
+}
+
+async function waitForPaint(): Promise<void> {
+  await nextAnimationFrame();
+  if (Platform.isMobile) {
+    await nextAnimationFrame();
+  }
 }
 
 function nextAnimationFrame(): Promise<void> {
@@ -731,18 +734,6 @@ async function writeBlobToClipboard(blob: Blob): Promise<void> {
   }
   const buf = Buffer.from(await blob.arrayBuffer());
   electron.clipboard.writeImage(electron.nativeImage.createFromBuffer(buf));
-}
-
-async function writeBlobPromiseToClipboard(blobPromise: Promise<Blob>): Promise<void> {
-  if (!navigator.clipboard?.write || typeof ClipboardItem === 'undefined') {
-    throw new Error('Clipboard API unavailable');
-  }
-
-  await navigator.clipboard.write([
-    new ClipboardItem({
-      'image/png': blobPromise,
-    }),
-  ]);
 }
 
 function showCaptureError(e: unknown): void {
