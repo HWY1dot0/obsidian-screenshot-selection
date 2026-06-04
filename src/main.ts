@@ -17,9 +17,12 @@ import { domToBlob, domToCanvas } from 'modern-screenshot';
 const PREVIEW_SELECTORS = '.markdown-preview-view, .markdown-reading-view, .cm-content';
 const MAX_CANVAS_HEIGHT = 30000;
 const MOBILE_MAX_CANVAS_HEIGHT = 16000;
-const IMAGE_TIMEOUT_MS = 3000;
+const DESKTOP_IMAGE_TIMEOUT_MS = 3000;
+const MOBILE_IMAGE_TIMEOUT_MS = 800;
+const DESKTOP_FONT_TIMEOUT_MS = 1000;
+const MOBILE_FONT_TIMEOUT_MS = 300;
 const DESKTOP_SCALE = 2;
-const MOBILE_SCALE = 1.5;
+const MOBILE_SCALE = 1.25;
 const SCREENSHOT_FOLDER = 'Attachments/Screenshots';
 
 type CaptureOutput = 'auto' | 'clipboard' | 'file';
@@ -164,6 +167,7 @@ export default class ScreenshotSelectionPlugin extends Plugin {
   }
 
   private async captureAuto(view: MarkdownView) {
+    const progress = new Notice('Capturing screenshot...', 0);
     const resultPromise = this.createCaptureResult(view, 'file');
     const blobPromise = resultPromise.then((result) => {
       if (!result) throw new Error('No note content to capture');
@@ -172,6 +176,7 @@ export default class ScreenshotSelectionPlugin extends Plugin {
 
     try {
       await writeBlobPromiseToClipboard(blobPromise);
+      progress.hide();
       new Notice('Copied screenshot to clipboard', 2000);
       return;
     } catch (e) {
@@ -188,6 +193,8 @@ export default class ScreenshotSelectionPlugin extends Plugin {
       await this.saveCaptureResult(view, result, 'Copied failed; saved screenshot and inserted link');
     } catch (e) {
       showCaptureError(e);
+    } finally {
+      progress.hide();
     }
   }
 
@@ -205,6 +212,7 @@ export default class ScreenshotSelectionPlugin extends Plugin {
       document.body.appendChild(offscreen);
 
       await waitForAssets(offscreen);
+      trimOffscreenToContent(offscreen);
 
       const inner = offscreen.firstElementChild as HTMLElement;
       const maxHeight = Platform.isMobile ? MOBILE_MAX_CANVAS_HEIGHT : MAX_CANVAS_HEIGHT;
@@ -249,6 +257,8 @@ async function buildFileSource(plugin: ScreenshotSelectionPlugin, view: Markdown
 
   const selectionSource = buildDomSelectionSource(view, Platform.isMobile, true);
   if (selectionSource) return selectionSource;
+
+  if (Platform.isMobile) return null;
 
   return buildVisibleViewSource(view, Platform.isMobile);
 }
@@ -361,12 +371,14 @@ function nodeAsElement(node: Node): Element | null {
 
 function createCaptureWrap(mobile: boolean): HTMLDivElement {
   const wrap = document.createElement('div');
+  wrap.className = 'screenshot-selection-capture';
   wrap.style.cssText = [
     'position: fixed',
     'left: -10000px',
     'top: 0',
     'z-index: -1',
     'pointer-events: none',
+    'height: auto',
     `width: ${mobile ? 'min(390px, calc(100vw - 32px))' : 'var(--file-line-width, 760px)'}`,
     `max-width: ${mobile ? '390px' : '900px'}`,
     'background: var(--background-primary)',
@@ -383,8 +395,16 @@ function createCaptureWrap(mobile: boolean): HTMLDivElement {
 
 function createRenderedInner(): HTMLDivElement {
   const inner = document.createElement('div');
-  inner.className = 'markdown-preview-view markdown-rendered show-indentation-guide';
-  inner.style.cssText = 'width: 100%; padding: 0;';
+  inner.className = 'markdown-preview-view markdown-rendered show-indentation-guide screenshot-selection-inner';
+  inner.style.cssText = [
+    'width: 100%',
+    'height: auto',
+    'min-height: 0',
+    'max-height: none',
+    'padding: 0',
+    'margin: 0',
+    'overflow: visible',
+  ].join(';');
 
   return inner;
 }
@@ -402,6 +422,20 @@ function buildSelectionOffscreen(range: Range, mobile: boolean): HTMLDivElement 
 function appendCaptureFix(inner: HTMLElement): void {
   const fix = document.createElement('style');
   fix.textContent = `
+    .screenshot-selection-inner,
+    .screenshot-selection-inner.markdown-preview-view,
+    .screenshot-selection-inner.markdown-rendered,
+    .screenshot-selection-inner .markdown-preview-view,
+    .screenshot-selection-inner .markdown-rendered,
+    .screenshot-selection-inner .cm-content {
+      height: auto !important;
+      min-height: 0 !important;
+      max-height: none !important;
+      padding-bottom: 0 !important;
+      margin-bottom: 0 !important;
+      overflow: visible !important;
+    }
+    .screenshot-selection-inner > :last-child { margin-bottom: 0 !important; }
     pre, .cm-line, code { white-space: pre-wrap !important; word-break: break-word; }
     iframe, embed, object, video { display: none !important; }
     img { max-width: 100% !important; height: auto !important; }
@@ -412,20 +446,59 @@ function appendCaptureFix(inner: HTMLElement): void {
 
 async function waitForAssets(root: HTMLElement): Promise<void> {
   try {
-    await document.fonts.ready;
+    await withTimeout(document.fonts.ready, Platform.isMobile ? MOBILE_FONT_TIMEOUT_MS : DESKTOP_FONT_TIMEOUT_MS);
   } catch {
     /* fonts.ready can reject in odd states; not fatal */
   }
   const imgs = Array.from(root.querySelectorAll('img')) as HTMLImageElement[];
+  const imageTimeout = Platform.isMobile ? MOBILE_IMAGE_TIMEOUT_MS : DESKTOP_IMAGE_TIMEOUT_MS;
   await Promise.all(
     imgs.map((img) => {
       if (img.complete && img.naturalWidth > 0) return null;
       return Promise.race([
         img.decode().catch(() => null),
-        new Promise((r) => setTimeout(r, IMAGE_TIMEOUT_MS)),
+        new Promise((r) => setTimeout(r, imageTimeout)),
       ]);
     }),
   );
+}
+
+function trimOffscreenToContent(offscreen: HTMLElement): void {
+  const inner = offscreen.firstElementChild as HTMLElement | null;
+  if (!inner) return;
+
+  const contentHeight = measureContentHeight(inner);
+  if (contentHeight <= 0) return;
+
+  inner.style.height = `${contentHeight}px`;
+  inner.style.minHeight = '0';
+  inner.style.maxHeight = 'none';
+  inner.style.overflow = 'visible';
+}
+
+function measureContentHeight(container: HTMLElement): number {
+  const containerTop = container.getBoundingClientRect().top;
+  let bottom = 0;
+
+  for (const child of Array.from(container.children) as HTMLElement[]) {
+    if (child.tagName === 'STYLE') continue;
+
+    const rect = child.getBoundingClientRect();
+    if (rect.width === 0 && rect.height === 0) continue;
+
+    const style = getComputedStyle(child);
+    const marginBottom = parseFloat(style.marginBottom) || 0;
+    bottom = Math.max(bottom, rect.bottom - containerTop + marginBottom);
+  }
+
+  return Math.ceil(bottom);
+}
+
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T | null> {
+  return Promise.race([
+    promise,
+    new Promise<null>((resolve) => setTimeout(() => resolve(null), ms)),
+  ]);
 }
 
 async function captureWithWatermark(
