@@ -1,13 +1,35 @@
-import { App, MarkdownView, Notice, Plugin, PluginSettingTab, Setting } from 'obsidian';
+import {
+  App,
+  Editor,
+  EditorPosition,
+  MarkdownRenderer,
+  MarkdownView,
+  Notice,
+  Platform,
+  Plugin,
+  PluginSettingTab,
+  Setting,
+  TFile,
+  normalizePath,
+} from 'obsidian';
 import { domToBlob, domToCanvas } from 'modern-screenshot';
 
 const PREVIEW_SELECTORS = '.markdown-preview-view, .markdown-reading-view, .cm-content';
 const MAX_CANVAS_HEIGHT = 30000;
+const MOBILE_MAX_CANVAS_HEIGHT = 16000;
 const IMAGE_TIMEOUT_MS = 3000;
-const SCALE = 2;
+const DESKTOP_SCALE = 2;
+const MOBILE_SCALE = 1.5;
+const SCREENSHOT_FOLDER = 'Attachments/Screenshots';
 
+type CaptureOutput = 'clipboard' | 'file';
 type WatermarkStyle = 'corner' | 'tiled';
 type WatermarkCorner = 'top-left' | 'top-right' | 'bottom-left' | 'bottom-right';
+
+interface CaptureSource {
+  offscreen: HTMLDivElement;
+  insertAfter?: EditorPosition;
+}
 
 interface WatermarkSettings {
   enabled: boolean;
@@ -43,16 +65,31 @@ export default class ScreenshotSelectionPlugin extends Plugin {
 
     this.addCommand({
       id: 'capture-selection-as-png',
-      name: 'Screenshot selection to clipboard',
+      name: Platform.isMobile ? 'Screenshot selection or block to file' : 'Screenshot selection to clipboard',
       callback: () => {
         const view = this.app.workspace.getActiveViewOfType(MarkdownView);
         if (!view) {
           new Notice('Open a markdown note first');
           return;
         }
-        void this.capture(view);
+        void this.capture(view, Platform.isMobile ? 'file' : 'clipboard');
       },
     });
+
+    if (!Platform.isMobile) {
+      this.addCommand({
+        id: 'capture-selection-as-png-file',
+        name: 'Screenshot selection or block to file',
+        callback: () => {
+          const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+          if (!view) {
+            new Notice('Open a markdown note first');
+            return;
+          }
+          void this.capture(view, 'file');
+        },
+      });
+    }
 
     this.addSettingTab(new ScreenshotSelectionSettingTab(this.app, this));
   }
@@ -72,56 +109,54 @@ export default class ScreenshotSelectionPlugin extends Plugin {
     await this.saveData(this.settings);
   }
 
-  private async capture(view: MarkdownView) {
+  private async capture(view: MarkdownView, output: CaptureOutput) {
     let offscreen: HTMLDivElement | null = null;
 
     try {
-      const sel = window.getSelection();
-      if (!sel || sel.rangeCount === 0 || sel.isCollapsed) {
-        new Notice('No content selected');
+      const source = output === 'file'
+        ? await buildFileSource(this, view)
+        : buildDomSelectionSource(view, Platform.isMobile);
+
+      if (!source) {
+        new Notice(output === 'file' ? 'No note content to capture' : 'No content selected');
         return;
       }
 
-      const range = sel.getRangeAt(0);
-      const anchor = nodeAsElement(range.commonAncestorContainer);
-      const previewRoot = anchor?.closest(PREVIEW_SELECTORS);
-
-      if (!previewRoot) {
-        if (view.getMode() === 'source') {
-          new Notice('Switch to Live Preview or Reading view to capture');
-        } else {
-          new Notice('Selection is outside the document');
-        }
-        return;
-      }
-
-      offscreen = buildOffscreen(range, previewRoot);
+      offscreen = source.offscreen;
       document.body.appendChild(offscreen);
 
       await waitForAssets(offscreen);
 
       const inner = offscreen.firstElementChild as HTMLElement;
-      if (inner.offsetHeight > MAX_CANVAS_HEIGHT) {
+      const maxHeight = Platform.isMobile ? MOBILE_MAX_CANVAS_HEIGHT : MAX_CANVAS_HEIGHT;
+      if (inner.offsetHeight > maxHeight) {
         new Notice(`Selection too tall (${inner.offsetHeight}px). Select less and retry.`);
         return;
       }
 
       const bg = getComputedStyle(document.body).getPropertyValue('--background-primary').trim() || '#ffffff';
-
+      const scale = Platform.isMobile ? MOBILE_SCALE : DESKTOP_SCALE;
       const wm = this.settings.watermark;
       const useWatermark = wm.enabled && wm.text.trim().length > 0;
 
       const blob = useWatermark
-        ? await captureWithWatermark(offscreen, bg, wm)
-        : await domToBlob(offscreen, { scale: SCALE, type: 'image/png', backgroundColor: bg });
+        ? await captureWithWatermark(offscreen, bg, wm, scale)
+        : await domToBlob(offscreen, { scale, type: 'image/png', backgroundColor: bg });
 
       if (!blob) {
         new Notice('Capture failed: empty image');
         return;
       }
 
-      await writeBlobToClipboard(blob);
-      new Notice('Copied selection as image', 2000);
+      if (output === 'clipboard') {
+        await writeBlobToClipboard(blob);
+        new Notice('Copied selection as image', 2000);
+        return;
+      }
+
+      const file = await saveBlobToVault(this.app, blob, view);
+      const inserted = insertFileLink(view, file, source.insertAfter);
+      new Notice(inserted ? 'Saved screenshot and inserted link' : `Saved screenshot to ${file.path}`, 3000);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       console.error('[screenshot-selection]', e);
@@ -132,11 +167,125 @@ export default class ScreenshotSelectionPlugin extends Plugin {
   }
 }
 
+async function buildFileSource(plugin: ScreenshotSelectionPlugin, view: MarkdownView): Promise<CaptureSource | null> {
+  if (view.getMode() === 'source') {
+    const editorSource = await buildEditorMarkdownSource(plugin, view);
+    if (editorSource) return editorSource;
+  }
+
+  const selectionSource = buildDomSelectionSource(view, Platform.isMobile, true);
+  if (selectionSource) return selectionSource;
+
+  return buildVisibleViewSource(view, Platform.isMobile);
+}
+
+async function buildEditorMarkdownSource(plugin: ScreenshotSelectionPlugin, view: MarkdownView): Promise<CaptureSource | null> {
+  const editor = view.editor;
+  if (!editor) return null;
+
+  const sourcePath = view.file?.path ?? '';
+  const selectedMarkdown = editor.getSelection();
+  if (selectedMarkdown.trim()) {
+    return {
+      offscreen: await buildMarkdownOffscreen(plugin, selectedMarkdown, sourcePath, Platform.isMobile),
+      insertAfter: editor.getCursor('to'),
+    };
+  }
+
+  const block = getCurrentMarkdownBlock(editor);
+  if (!block?.markdown.trim()) return null;
+
+  return {
+    offscreen: await buildMarkdownOffscreen(plugin, block.markdown, sourcePath, Platform.isMobile),
+    insertAfter: block.end,
+  };
+}
+
+function buildDomSelectionSource(view: MarkdownView, mobile: boolean, quiet = false): CaptureSource | null {
+  const sel = window.getSelection();
+  if (!sel || sel.rangeCount === 0 || sel.isCollapsed) return null;
+
+  const range = sel.getRangeAt(0);
+  const anchor = nodeAsElement(range.commonAncestorContainer);
+  const previewRoot = anchor?.closest(PREVIEW_SELECTORS);
+
+  if (!previewRoot) {
+    if (!quiet) {
+      if (view.getMode() === 'source') {
+        new Notice('Switch to Live Preview or Reading view to capture');
+      } else {
+        new Notice('Selection is outside the document');
+      }
+    }
+    return null;
+  }
+
+  return {
+    offscreen: buildSelectionOffscreen(range, mobile),
+  };
+}
+
+function buildVisibleViewSource(view: MarkdownView, mobile: boolean): CaptureSource | null {
+  const root = view.containerEl.querySelector(PREVIEW_SELECTORS);
+  if (!root) return null;
+
+  const wrap = createCaptureWrap(mobile);
+  const inner = createRenderedInner();
+  inner.appendChild(root.cloneNode(true));
+  appendCaptureFix(inner);
+  wrap.appendChild(inner);
+
+  return { offscreen: wrap };
+}
+
+async function buildMarkdownOffscreen(
+  plugin: ScreenshotSelectionPlugin,
+  markdown: string,
+  sourcePath: string,
+  mobile: boolean,
+): Promise<HTMLDivElement> {
+  const wrap = createCaptureWrap(mobile);
+  const inner = createRenderedInner();
+  wrap.appendChild(inner);
+
+  await MarkdownRenderer.render(plugin.app, markdown, inner, sourcePath, plugin);
+  appendCaptureFix(inner);
+
+  return wrap;
+}
+
+function getCurrentMarkdownBlock(editor: Editor): { markdown: string; end: EditorPosition } | null {
+  const cursor = editor.getCursor();
+  const lastLine = editor.lastLine();
+  let startLine = cursor.line;
+  let endLine = cursor.line;
+
+  if (!editor.getLine(cursor.line).trim()) return null;
+
+  while (startLine > 0 && editor.getLine(startLine - 1).trim()) {
+    startLine -= 1;
+  }
+
+  while (endLine < lastLine && editor.getLine(endLine + 1).trim()) {
+    endLine += 1;
+  }
+
+  const end: EditorPosition = {
+    line: endLine,
+    ch: editor.getLine(endLine).length,
+  };
+
+  return {
+    markdown: editor.getRange({ line: startLine, ch: 0 }, end),
+    end,
+  };
+}
+
 function nodeAsElement(node: Node): Element | null {
   return node.nodeType === Node.ELEMENT_NODE ? (node as Element) : node.parentElement;
 }
 
-function buildOffscreen(range: Range, previewRoot: Element): HTMLDivElement {
+function createCaptureWrap(mobile: boolean): HTMLDivElement {
   const wrap = document.createElement('div');
   wrap.style.cssText = [
     'position: fixed',
@@ -144,32 +293,47 @@ function buildOffscreen(range: Range, previewRoot: Element): HTMLDivElement {
     'top: 0',
     'z-index: -1',
     'pointer-events: none',
-    'width: var(--file-line-width, 760px)',
-    'max-width: 900px',
+    `width: ${mobile ? 'min(390px, calc(100vw - 32px))' : 'var(--file-line-width, 760px)'}`,
+    `max-width: ${mobile ? '390px' : '900px'}`,
     'background: var(--background-primary)',
     'color: var(--text-normal)',
-    'padding: 28px 32px',
+    `padding: ${mobile ? '18px 20px' : '28px 32px'}`,
     'box-sizing: border-box',
     'font-family: var(--font-text)',
-    'font-size: var(--font-text-size)',
+    'font-size: var(--font-text-size, 16px)',
     'line-height: var(--line-height-normal)',
   ].join(';');
 
+  return wrap;
+}
+
+function createRenderedInner(): HTMLDivElement {
   const inner = document.createElement('div');
   inner.className = 'markdown-preview-view markdown-rendered show-indentation-guide';
   inner.style.cssText = 'width: 100%; padding: 0;';
-  inner.appendChild(range.cloneContents());
 
+  return inner;
+}
+
+function buildSelectionOffscreen(range: Range, mobile: boolean): HTMLDivElement {
+  const wrap = createCaptureWrap(mobile);
+  const inner = createRenderedInner();
+  inner.appendChild(range.cloneContents());
+  appendCaptureFix(inner);
+
+  wrap.appendChild(inner);
+  return wrap;
+}
+
+function appendCaptureFix(inner: HTMLElement): void {
   const fix = document.createElement('style');
   fix.textContent = `
     pre, .cm-line, code { white-space: pre-wrap !important; word-break: break-word; }
     iframe, embed, object, video { display: none !important; }
     img { max-width: 100% !important; height: auto !important; }
+    .cm-cursor, .cm-selectionBackground { display: none !important; }
   `;
   inner.appendChild(fix);
-
-  wrap.appendChild(inner);
-  return wrap;
 }
 
 async function waitForAssets(root: HTMLElement): Promise<void> {
@@ -194,9 +358,10 @@ async function captureWithWatermark(
   offscreen: HTMLElement,
   bg: string,
   wm: WatermarkSettings,
+  scale: number,
 ): Promise<Blob | null> {
-  const canvas = await domToCanvas(offscreen, { scale: SCALE, backgroundColor: bg });
-  const effScale = offscreen.offsetWidth > 0 ? canvas.width / offscreen.offsetWidth : SCALE;
+  const canvas = await domToCanvas(offscreen, { scale, backgroundColor: bg });
+  const effScale = offscreen.offsetWidth > 0 ? canvas.width / offscreen.offsetWidth : scale;
   drawWatermark(canvas, wm, effScale);
   return await new Promise<Blob | null>((resolve) =>
     canvas.toBlob((b) => resolve(b), 'image/png'),
@@ -254,6 +419,80 @@ function resolveWatermarkColor(color: string): string {
 
 function clamp(n: number, lo: number, hi: number): number {
   return Math.min(Math.max(n, lo), hi);
+}
+
+async function saveBlobToVault(app: App, blob: Blob, view: MarkdownView): Promise<TFile> {
+  await ensureFolder(app, SCREENSHOT_FOLDER);
+
+  const noteBaseName = sanitizeFileName(view.file?.basename ?? 'note');
+  const basePath = normalizePath(`${SCREENSHOT_FOLDER}/${noteBaseName}-${timestampForFile()}.png`);
+  const path = await getAvailablePath(app, basePath);
+
+  return app.vault.createBinary(path, await blob.arrayBuffer());
+}
+
+async function ensureFolder(app: App, folderPath: string): Promise<void> {
+  const normalized = normalizePath(folderPath);
+  const parts = normalized.split('/').filter(Boolean);
+  let current = '';
+
+  for (const part of parts) {
+    current = current ? `${current}/${part}` : part;
+    if (!app.vault.getFolderByPath(current)) {
+      await app.vault.createFolder(current);
+    }
+  }
+}
+
+async function getAvailablePath(app: App, path: string): Promise<string> {
+  if (!app.vault.getAbstractFileByPath(path)) return path;
+
+  const extIndex = path.lastIndexOf('.');
+  const stem = extIndex >= 0 ? path.slice(0, extIndex) : path;
+  const ext = extIndex >= 0 ? path.slice(extIndex) : '';
+
+  for (let i = 2; i < 1000; i += 1) {
+    const candidate = `${stem}-${i}${ext}`;
+    if (!app.vault.getAbstractFileByPath(candidate)) return candidate;
+  }
+
+  throw new Error('Could not find an available screenshot filename');
+}
+
+function insertFileLink(view: MarkdownView, file: TFile, insertAfter?: EditorPosition): boolean {
+  const editor = view.editor;
+  if (!editor || view.getMode() !== 'source') return false;
+
+  const sourcePath = view.file?.path ?? '';
+  let link = view.app.fileManager.generateMarkdownLink(file, sourcePath);
+  if (!link.startsWith('!')) link = `!${link}`;
+
+  const pos = insertAfter ?? editor.getCursor('to');
+  const line = editor.getLine(pos.line);
+  const prefix = pos.ch === 0 ? '' : '\n';
+  const suffix = line.slice(pos.ch).trim() ? '\n' : '';
+
+  editor.replaceRange(`${prefix}${link}\n${suffix}`, pos, pos, 'screenshot-selection');
+  return true;
+}
+
+function sanitizeFileName(name: string): string {
+  return name.replace(/[\\/:*?"<>|#^\[\]]+/g, '-').replace(/\s+/g, ' ').trim() || 'note';
+}
+
+function timestampForFile(): string {
+  const d = new Date();
+  const pad = (n: number) => n.toString().padStart(2, '0');
+
+  return [
+    d.getFullYear(),
+    pad(d.getMonth() + 1),
+    pad(d.getDate()),
+    '-',
+    pad(d.getHours()),
+    pad(d.getMinutes()),
+    pad(d.getSeconds()),
+  ].join('');
 }
 
 async function writeBlobToClipboard(blob: Blob): Promise<void> {

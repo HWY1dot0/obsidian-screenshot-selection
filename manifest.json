@@ -1,11 +1,11 @@
 {
   "id": "screenshot-selection",
   "name": "Screenshot Selection",
-  "version": "0.1.4",
+  "version": "0.2.0",
   "minAppVersion": "1.5.0",
-  "description": "Capture the currently selected content as a PNG and copy it to the clipboard.",
+  "description": "Capture selected note content as a PNG. Copies to clipboard on desktop and saves to the vault on mobile.",
   "author": "HWY1dot0",
   "authorUrl": "https://github.com/HWY1dot0",
   "fundingUrl": "https://buymeacoffee.com/hwy1dot0",
-  "isDesktopOnly": true
+  "isDesktopOnly": false
 }

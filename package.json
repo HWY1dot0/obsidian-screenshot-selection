@@ -1,7 +1,7 @@
 {
   "name": "obsidian-screenshot-selection",
-  "version": "0.1.4",
-  "description": "Capture selected content in Obsidian as a PNG to clipboard.",
+  "version": "0.2.0",
+  "description": "Capture selected content in Obsidian as a PNG.",
   "main": "main.js",
   "scripts": {
     "dev": "node esbuild.config.mjs",
