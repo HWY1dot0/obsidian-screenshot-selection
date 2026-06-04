@@ -41,8 +41,8 @@ Assign a hotkey via Settings → Hotkeys for one-keystroke capture.
 
 ### Mobile
 
-1. Open a note in the editor
-2. Select markdown text, or place the cursor inside the block you want to capture
+1. Open a note — Reading View gives the most faithful result
+2. Select the text you want to capture (or, in the editor, place the cursor inside a block to capture the whole block)
 3. Tap the camera ribbon action, use the editor menu item, or run **Screenshot selection or block**
 4. If clipboard writing succeeds, paste the PNG into another app
 5. If iOS rejects clipboard writing, the PNG is saved under `Attachments/Screenshots/`; when possible, an image embed is inserted below the captured block
@@ -61,7 +61,7 @@ The watermark is drawn onto the image at capture time, so it stays on the PNG yo
 ## Known limits
 
 - Desktop clipboard capture expects a rendered selection — switch to Live Preview or Reading View
-- Mobile capture can render selected markdown or the current markdown block from the editor
+- Mobile is most faithful in Reading View; Live Preview clones the editor DOM and may look different. If iOS can't rasterize the selection, the capture falls back to a plainer text render
 - Mobile clipboard image write may still be rejected by iOS; the plugin falls back to saving a vault file
 - Cross-origin embeds (iframes, external PDFs) are hidden in the captured image
 - Very tall selections are rejected — split into smaller captures
