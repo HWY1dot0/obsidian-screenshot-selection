@@ -32,6 +32,7 @@ type WatermarkCorner = 'top-left' | 'top-right' | 'bottom-left' | 'bottom-right'
 interface CaptureSource {
   offscreen: HTMLDivElement;
   insertAfter?: EditorPosition;
+  fallbackMarkdown?: string;
 }
 
 interface CaptureResult {
@@ -256,9 +257,11 @@ export default class ScreenshotSelectionPlugin extends Plugin {
       const wm = this.settings.watermark;
       const useWatermark = wm.enabled && wm.text.trim().length > 0;
 
-      const blob = useWatermark
-        ? await captureWithWatermark(offscreen, bg, wm, scale)
-        : await domToBlob(offscreen, { scale, type: 'image/png', backgroundColor: bg });
+      const blob = Platform.isMobile && source.fallbackMarkdown?.trim()
+        ? await renderMarkdownCanvasBlob(source.fallbackMarkdown, useWatermark ? wm : null)
+        : useWatermark
+          ? await captureWithWatermark(offscreen, bg, wm, scale)
+          : await domToBlob(offscreen, { scale, type: 'image/png', backgroundColor: bg });
 
       if (!blob) {
         throw new Error('Capture failed: empty image');
@@ -312,6 +315,7 @@ async function buildSnapshotSource(
   return {
     offscreen: await buildMarkdownOffscreen(plugin, snapshot.markdown, snapshot.sourcePath, mobile),
     insertAfter: snapshot.insertAfter,
+    fallbackMarkdown: snapshot.markdown,
   };
 }
 
@@ -356,6 +360,7 @@ function buildDomSelectionSource(view: MarkdownView, mobile: boolean, quiet = fa
 
   return {
     offscreen: buildSelectionOffscreen(range, mobile),
+    fallbackMarkdown: range.toString(),
   };
 }
 
@@ -577,6 +582,295 @@ async function waitForPaint(): Promise<void> {
 
 function nextAnimationFrame(): Promise<void> {
   return new Promise((resolve) => requestAnimationFrame(() => resolve()));
+}
+
+interface CanvasTheme {
+  background: string;
+  text: string;
+  muted: string;
+  accent: string;
+  codeBackground: string;
+  font: string;
+  monospaceFont: string;
+}
+
+interface CanvasRow {
+  text: string;
+  x: number;
+  y: number;
+  maxWidth: number;
+  fontSize: number;
+  lineHeight: number;
+  fontWeight: string;
+  fontFamily: string;
+  color: string;
+  background?: string;
+  accent?: string;
+}
+
+async function renderMarkdownCanvasBlob(markdown: string, wm: WatermarkSettings | null): Promise<Blob | null> {
+  const theme = getCanvasTheme();
+  const scale = Math.min(Math.max(window.devicePixelRatio || 2, 1.5), 2.5);
+  const cssWidth = Math.min(390, Math.max(320, window.innerWidth - 24));
+  const paddingX = 22;
+  const paddingY = 20;
+  const contentWidth = cssWidth - paddingX * 2;
+  const measureCanvas = document.createElement('canvas');
+  const measureCtx = measureCanvas.getContext('2d');
+  if (!measureCtx) throw new Error('Canvas unavailable');
+
+  const rows = layoutMarkdownCanvasRows(markdown, measureCtx, theme, paddingX, paddingY, contentWidth);
+  const lastRow = rows[rows.length - 1];
+  const cssHeight = Math.max(80, Math.ceil((lastRow ? lastRow.y + lastRow.lineHeight : paddingY) + paddingY));
+
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.ceil(cssWidth * scale);
+  canvas.height = Math.ceil(cssHeight * scale);
+
+  const ctx = canvas.getContext('2d');
+  if (!ctx) throw new Error('Canvas unavailable');
+
+  ctx.save();
+  ctx.scale(scale, scale);
+  ctx.fillStyle = theme.background;
+  ctx.fillRect(0, 0, cssWidth, cssHeight);
+
+  for (const row of rows) {
+    if (row.background) {
+      ctx.fillStyle = row.background;
+      ctx.fillRect(paddingX - 8, row.y - row.fontSize - 4, contentWidth + 16, row.lineHeight + 4);
+    }
+    if (row.accent) {
+      ctx.fillStyle = row.accent;
+      ctx.fillRect(paddingX - 10, row.y - row.fontSize - 2, 3, row.lineHeight + 2);
+    }
+
+    ctx.fillStyle = row.color;
+    ctx.font = `${row.fontWeight} ${row.fontSize}px ${row.fontFamily}`;
+    ctx.textBaseline = 'alphabetic';
+    ctx.fillText(row.text, row.x, row.y, row.maxWidth);
+  }
+  ctx.restore();
+
+  if (wm?.text.trim()) {
+    drawWatermark(canvas, wm, scale);
+  }
+
+  return await canvasToBlob(canvas);
+}
+
+function layoutMarkdownCanvasRows(
+  markdown: string,
+  ctx: CanvasRenderingContext2D,
+  theme: CanvasTheme,
+  paddingX: number,
+  paddingY: number,
+  contentWidth: number,
+): CanvasRow[] {
+  const rows: CanvasRow[] = [];
+  let y = paddingY;
+  let inCode = false;
+
+  for (const rawLine of markdown.replace(/\r\n?/g, '\n').split('\n')) {
+    const fence = rawLine.match(/^\s*```/);
+    if (fence) {
+      inCode = !inCode;
+      y += rows.length ? 8 : 0;
+      continue;
+    }
+
+    if (!rawLine.trim()) {
+      y += 10;
+      continue;
+    }
+
+    const style = getMarkdownCanvasLineStyle(rawLine, inCode, theme);
+    ctx.font = `${style.fontWeight} ${style.fontSize}px ${style.fontFamily}`;
+    const wrapped = wrapCanvasText(ctx, style.text, contentWidth - style.indent);
+
+    for (const line of wrapped) {
+      y += style.lineHeight;
+      rows.push({
+        text: line,
+        x: paddingX + style.indent,
+        y,
+        maxWidth: contentWidth - style.indent,
+        fontSize: style.fontSize,
+        lineHeight: style.lineHeight,
+        fontWeight: style.fontWeight,
+        fontFamily: style.fontFamily,
+        color: style.color,
+        background: style.background,
+        accent: style.accent,
+      });
+    }
+
+    y += style.after;
+  }
+
+  return rows;
+}
+
+function getMarkdownCanvasLineStyle(line: string, inCode: boolean, theme: CanvasTheme) {
+  if (inCode) {
+    return {
+      text: line.replace(/\t/g, '  '),
+      indent: 0,
+      fontSize: 13,
+      lineHeight: 19,
+      fontWeight: '400',
+      fontFamily: theme.monospaceFont,
+      color: theme.text,
+      background: theme.codeBackground,
+      accent: '',
+      after: 0,
+    };
+  }
+
+  const heading = line.match(/^(#{1,6})\s+(.+)$/);
+  if (heading) {
+    const level = heading[1].length;
+    const fontSize = level === 1 ? 24 : level === 2 ? 21 : 18;
+    return {
+      text: stripInlineMarkdown(heading[2]),
+      indent: 0,
+      fontSize,
+      lineHeight: Math.round(fontSize * 1.35),
+      fontWeight: '700',
+      fontFamily: theme.font,
+      color: theme.text,
+      background: '',
+      accent: '',
+      after: 8,
+    };
+  }
+
+  const quote = line.match(/^\s*>\s?(.*)$/);
+  if (quote) {
+    return {
+      text: stripInlineMarkdown(quote[1].replace(/^\[![^\]]+\]\s*/, '')),
+      indent: 8,
+      fontSize: 15,
+      lineHeight: 22,
+      fontWeight: '400',
+      fontFamily: theme.font,
+      color: theme.text,
+      background: '',
+      accent: theme.accent,
+      after: 2,
+    };
+  }
+
+  const list = line.match(/^\s*([-*+]|\d+[.)])\s+(.+)$/);
+  if (list) {
+    const marker = /^\d/.test(list[1]) ? `${list[1]} ` : '- ';
+    return {
+      text: `${marker}${stripInlineMarkdown(list[2].replace(/^\[[ xX]\]\s+/, ''))}`,
+      indent: 8,
+      fontSize: 16,
+      lineHeight: 23,
+      fontWeight: '400',
+      fontFamily: theme.font,
+      color: theme.text,
+      background: '',
+      accent: '',
+      after: 2,
+    };
+  }
+
+  return {
+    text: stripInlineMarkdown(line),
+    indent: 0,
+    fontSize: 16,
+    lineHeight: 24,
+    fontWeight: '400',
+    fontFamily: theme.font,
+    color: theme.text,
+    background: '',
+    accent: '',
+    after: 4,
+  };
+}
+
+function wrapCanvasText(ctx: CanvasRenderingContext2D, text: string, maxWidth: number): string[] {
+  const words = text.trim().split(/\s+/).filter(Boolean);
+  if (words.length === 0) return [''];
+
+  const lines: string[] = [];
+  let current = '';
+
+  for (const word of words) {
+    const candidate = current ? `${current} ${word}` : word;
+    if (ctx.measureText(candidate).width <= maxWidth) {
+      current = candidate;
+      continue;
+    }
+
+    if (current) lines.push(current);
+    if (ctx.measureText(word).width <= maxWidth) {
+      current = word;
+    } else {
+      const broken = breakLongCanvasWord(ctx, word, maxWidth);
+      lines.push(...broken.slice(0, -1));
+      current = broken[broken.length - 1] ?? '';
+    }
+  }
+
+  if (current) lines.push(current);
+  return lines;
+}
+
+function breakLongCanvasWord(ctx: CanvasRenderingContext2D, word: string, maxWidth: number): string[] {
+  const lines: string[] = [];
+  let current = '';
+
+  for (const ch of Array.from(word)) {
+    const candidate = current + ch;
+    if (ctx.measureText(candidate).width <= maxWidth) {
+      current = candidate;
+      continue;
+    }
+
+    if (current) lines.push(current);
+    current = ch;
+  }
+
+  if (current) lines.push(current);
+  return lines;
+}
+
+function stripInlineMarkdown(text: string): string {
+  return text
+    .replace(/!\[\[([^\]|]+)(?:\|([^\]]+))?\]\]/g, (_m, target, alias) => `[image: ${alias || target}]`)
+    .replace(/\[\[([^\]|]+)(?:\|([^\]]+))?\]\]/g, (_m, target, alias) => alias || target)
+    .replace(/!\[([^\]]*)\]\([^)]+\)/g, (_m, alt) => alt ? `[image: ${alt}]` : '[image]')
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+    .replace(/`([^`]+)`/g, '$1')
+    .replace(/(\*\*|__)(.*?)\1/g, '$2')
+    .replace(/(\*|_)(.*?)\1/g, '$2')
+    .replace(/~~(.*?)~~/g, '$1')
+    .replace(/<[^>]+>/g, '')
+    .trim();
+}
+
+function getCanvasTheme(): CanvasTheme {
+  return {
+    background: cssVar('--background-primary', '#ffffff'),
+    text: cssVar('--text-normal', '#222222'),
+    muted: cssVar('--text-muted', '#666666'),
+    accent: cssVar('--interactive-accent', '#7c6df2'),
+    codeBackground: cssVar('--code-background', cssVar('--background-secondary', '#f4f4f4')),
+    font: cssVar('--font-text', '-apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif'),
+    monospaceFont: cssVar('--font-monospace', 'ui-monospace, SFMono-Regular, Menlo, monospace'),
+  };
+}
+
+function cssVar(name: string, fallback: string): string {
+  return getComputedStyle(document.body).getPropertyValue(name).trim() || fallback;
+}
+
+function canvasToBlob(canvas: HTMLCanvasElement): Promise<Blob | null> {
+  return new Promise((resolve) => canvas.toBlob((blob) => resolve(blob), 'image/png'));
 }
 
 async function captureWithWatermark(
