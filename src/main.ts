@@ -22,12 +22,17 @@ const DESKTOP_SCALE = 2;
 const MOBILE_SCALE = 1.5;
 const SCREENSHOT_FOLDER = 'Attachments/Screenshots';
 
-type CaptureOutput = 'clipboard' | 'file';
+type CaptureOutput = 'auto' | 'clipboard' | 'file';
 type WatermarkStyle = 'corner' | 'tiled';
 type WatermarkCorner = 'top-left' | 'top-right' | 'bottom-left' | 'bottom-right';
 
 interface CaptureSource {
   offscreen: HTMLDivElement;
+  insertAfter?: EditorPosition;
+}
+
+interface CaptureResult {
+  blob: Blob;
   insertAfter?: EditorPosition;
 }
 
@@ -65,14 +70,9 @@ export default class ScreenshotSelectionPlugin extends Plugin {
 
     this.addCommand({
       id: 'capture-selection-as-png',
-      name: Platform.isMobile ? 'Screenshot selection or block to file' : 'Screenshot selection to clipboard',
+      name: Platform.isMobile ? 'Screenshot selection or block' : 'Screenshot selection to clipboard',
       callback: () => {
-        const view = this.app.workspace.getActiveViewOfType(MarkdownView);
-        if (!view) {
-          new Notice('Open a markdown note first');
-          return;
-        }
-        void this.capture(view, Platform.isMobile ? 'file' : 'clipboard');
+        void this.captureActive(Platform.isMobile ? 'auto' : 'clipboard');
       },
     });
 
@@ -81,15 +81,34 @@ export default class ScreenshotSelectionPlugin extends Plugin {
         id: 'capture-selection-as-png-file',
         name: 'Screenshot selection or block to file',
         callback: () => {
-          const view = this.app.workspace.getActiveViewOfType(MarkdownView);
-          if (!view) {
-            new Notice('Open a markdown note first');
-            return;
-          }
-          void this.capture(view, 'file');
+          void this.captureActive('file');
         },
       });
     }
+
+    this.addRibbonIcon('camera', Platform.isMobile ? 'Screenshot selection or block' : 'Screenshot selection', () => {
+      void this.captureActive(Platform.isMobile ? 'auto' : 'clipboard');
+    });
+
+    this.registerEvent(
+      this.app.workspace.on('editor-menu', (menu, _editor, info) => {
+        menu.addItem((item) => {
+          item
+            .setTitle(Platform.isMobile ? 'Screenshot selection/block' : 'Screenshot selection/block to file')
+            .setIcon('camera')
+            .onClick(() => {
+              const view = info instanceof MarkdownView
+                ? info
+                : this.app.workspace.getActiveViewOfType(MarkdownView);
+              if (!view) {
+                new Notice('Open a markdown note first');
+                return;
+              }
+              void this.capture(view, Platform.isMobile ? 'auto' : 'file');
+            });
+        });
+      }),
+    );
 
     this.addSettingTab(new ScreenshotSelectionSettingTab(this.app, this));
   }
@@ -109,19 +128,79 @@ export default class ScreenshotSelectionPlugin extends Plugin {
     await this.saveData(this.settings);
   }
 
+  private async captureActive(output: CaptureOutput) {
+    const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+    if (!view) {
+      new Notice('Open a markdown note first');
+      return;
+    }
+
+    await this.capture(view, output);
+  }
+
   private async capture(view: MarkdownView, output: CaptureOutput) {
-    let offscreen: HTMLDivElement | null = null;
+    if (output === 'auto') {
+      await this.captureAuto(view);
+      return;
+    }
 
     try {
-      const source = output === 'file'
-        ? await buildFileSource(this, view)
-        : buildDomSelectionSource(view, Platform.isMobile);
-
-      if (!source) {
+      const result = await this.createCaptureResult(view, output);
+      if (!result) {
         new Notice(output === 'file' ? 'No note content to capture' : 'No content selected');
         return;
       }
 
+      if (output === 'clipboard') {
+        await writeBlobToClipboard(result.blob);
+        new Notice('Copied selection as image', 2000);
+        return;
+      }
+
+      await this.saveCaptureResult(view, result);
+    } catch (e) {
+      showCaptureError(e);
+    }
+  }
+
+  private async captureAuto(view: MarkdownView) {
+    const resultPromise = this.createCaptureResult(view, 'file');
+    const blobPromise = resultPromise.then((result) => {
+      if (!result) throw new Error('No note content to capture');
+      return result.blob;
+    });
+
+    try {
+      await writeBlobPromiseToClipboard(blobPromise);
+      new Notice('Copied screenshot to clipboard', 2000);
+      return;
+    } catch (e) {
+      console.warn('[screenshot-selection] mobile clipboard write failed, saving to vault', e);
+    }
+
+    try {
+      const result = await resultPromise;
+      if (!result) {
+        new Notice('No note content to capture');
+        return;
+      }
+
+      await this.saveCaptureResult(view, result, 'Copied failed; saved screenshot and inserted link');
+    } catch (e) {
+      showCaptureError(e);
+    }
+  }
+
+  private async createCaptureResult(view: MarkdownView, output: CaptureOutput): Promise<CaptureResult | null> {
+    let offscreen: HTMLDivElement | null = null;
+
+    const source = output === 'clipboard'
+      ? buildDomSelectionSource(view, Platform.isMobile)
+      : await buildFileSource(this, view);
+
+    if (!source) return null;
+
+    try {
       offscreen = source.offscreen;
       document.body.appendChild(offscreen);
 
@@ -130,8 +209,7 @@ export default class ScreenshotSelectionPlugin extends Plugin {
       const inner = offscreen.firstElementChild as HTMLElement;
       const maxHeight = Platform.isMobile ? MOBILE_MAX_CANVAS_HEIGHT : MAX_CANVAS_HEIGHT;
       if (inner.offsetHeight > maxHeight) {
-        new Notice(`Selection too tall (${inner.offsetHeight}px). Select less and retry.`);
-        return;
+        throw new Error(`Selection too tall (${inner.offsetHeight}px). Select less and retry.`);
       }
 
       const bg = getComputedStyle(document.body).getPropertyValue('--background-primary').trim() || '#ffffff';
@@ -144,26 +222,22 @@ export default class ScreenshotSelectionPlugin extends Plugin {
         : await domToBlob(offscreen, { scale, type: 'image/png', backgroundColor: bg });
 
       if (!blob) {
-        new Notice('Capture failed: empty image');
-        return;
+        throw new Error('Capture failed: empty image');
       }
 
-      if (output === 'clipboard') {
-        await writeBlobToClipboard(blob);
-        new Notice('Copied selection as image', 2000);
-        return;
-      }
-
-      const file = await saveBlobToVault(this.app, blob, view);
-      const inserted = insertFileLink(view, file, source.insertAfter);
-      new Notice(inserted ? 'Saved screenshot and inserted link' : `Saved screenshot to ${file.path}`, 3000);
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      console.error('[screenshot-selection]', e);
-      new Notice(`Capture failed: ${msg}`, 4000);
+      return {
+        blob,
+        insertAfter: source.insertAfter,
+      };
     } finally {
       offscreen?.remove();
     }
+  }
+
+  private async saveCaptureResult(view: MarkdownView, result: CaptureResult, insertedNotice = 'Saved screenshot and inserted link') {
+    const file = await saveBlobToVault(this.app, result.blob, view);
+    const inserted = insertFileLink(view, file, result.insertAfter);
+    new Notice(inserted ? insertedNotice : `Saved screenshot to ${file.path}`, 3000);
   }
 }
 
@@ -509,6 +583,24 @@ async function writeBlobToClipboard(blob: Blob): Promise<void> {
   }
   const buf = Buffer.from(await blob.arrayBuffer());
   electron.clipboard.writeImage(electron.nativeImage.createFromBuffer(buf));
+}
+
+async function writeBlobPromiseToClipboard(blobPromise: Promise<Blob>): Promise<void> {
+  if (!navigator.clipboard?.write || typeof ClipboardItem === 'undefined') {
+    throw new Error('Clipboard API unavailable');
+  }
+
+  await navigator.clipboard.write([
+    new ClipboardItem({
+      'image/png': blobPromise,
+    }),
+  ]);
+}
+
+function showCaptureError(e: unknown): void {
+  const msg = e instanceof Error ? e.message : String(e);
+  console.error('[screenshot-selection]', e);
+  new Notice(`Capture failed: ${msg}`, 4000);
 }
 
 class ScreenshotSelectionSettingTab extends PluginSettingTab {
