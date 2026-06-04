@@ -38,6 +38,7 @@ interface CaptureSource {
 interface CaptureResult {
   blob: Blob;
   insertAfter?: EditorPosition;
+  renderMode?: 'dom' | 'fallback';
 }
 
 interface MarkdownCaptureSnapshot {
@@ -219,12 +220,17 @@ export default class ScreenshotSelectionPlugin extends Plugin {
       }
 
       const result = await this.createCaptureResultFromSource(source);
+      const modeNote = result.renderMode === 'fallback'
+        ? ' (text fallback — iOS could not rasterize)'
+        : result.renderMode === 'dom'
+          ? ' (themed render)'
+          : '';
       try {
         await writeBlobToClipboard(result.blob);
-        new Notice('Copied screenshot to clipboard', 2000);
+        new Notice(`Copied screenshot to clipboard${modeNote}`, 2500);
       } catch (e) {
         console.warn('[screenshot-selection] mobile clipboard write failed, saving to vault', e);
-        await this.saveCaptureResult(view, result, 'Copy failed; saved screenshot and inserted link');
+        await this.saveCaptureResult(view, result, `Saved screenshot and inserted link${modeNote}`);
       }
     } catch (e) {
       showCaptureError(e);
@@ -242,9 +248,11 @@ export default class ScreenshotSelectionPlugin extends Plugin {
 
       await waitForAssets(offscreen);
       await waitForPaint();
-      if (!Platform.isMobile) {
-        trimOffscreenToContent(offscreen);
-      }
+      // Trim trailing whitespace on mobile too. This was previously desktop-only,
+      // which is why mobile captures (since 0.2.1) had a long blank strip below
+      // the content. The offscreen is attached and visible on mobile, so
+      // getBoundingClientRect-based measurement is valid here.
+      trimOffscreenToContent(offscreen);
 
       const inner = offscreen.firstElementChild as HTMLElement;
       const maxHeight = Platform.isMobile ? MOBILE_MAX_CANVAS_HEIGHT : MAX_CANVAS_HEIGHT;
@@ -257,11 +265,17 @@ export default class ScreenshotSelectionPlugin extends Plugin {
       const wm = this.settings.watermark;
       const useWatermark = wm.enabled && wm.text.trim().length > 0;
 
-      const blob = Platform.isMobile && source.fallbackMarkdown?.trim()
-        ? await renderMarkdownCanvasBlob(source.fallbackMarkdown, useWatermark ? wm : null)
-        : useWatermark
+      let renderMode: CaptureResult['renderMode'];
+      let blob: Blob | null;
+      if (Platform.isMobile) {
+        const mobile = await renderMobileCaptureBlob(offscreen, bg, scale, useWatermark ? wm : null, source.fallbackMarkdown);
+        blob = mobile.blob;
+        renderMode = mobile.usedFallback ? 'fallback' : 'dom';
+      } else {
+        blob = useWatermark
           ? await captureWithWatermark(offscreen, bg, wm, scale)
           : await domToBlob(offscreen, { scale, type: 'image/png', backgroundColor: bg });
+      }
 
       if (!blob) {
         throw new Error('Capture failed: empty image');
@@ -270,6 +284,7 @@ export default class ScreenshotSelectionPlugin extends Plugin {
       return {
         blob,
         insertAfter: source.insertAfter,
+        renderMode,
       };
     } finally {
       offscreen?.remove();
@@ -629,6 +644,88 @@ interface CanvasRow {
   color: string;
   background?: string;
   accent?: string;
+}
+
+// Mobile: iOS WKWebView rasterizes SVG <foreignObject> unreliably and often
+// yields a blank canvas. Try the real themed render first so the output matches
+// the note, detect a blank result, and only then fall back to the hand-drawn
+// markdown canvas. The previous build always took the fallback, which is why
+// mobile captures looked nothing like the note.
+async function renderMobileCaptureBlob(
+  offscreen: HTMLElement,
+  bg: string,
+  scale: number,
+  wm: WatermarkSettings | null,
+  fallbackMarkdown?: string,
+): Promise<{ blob: Blob | null; usedFallback: boolean }> {
+  try {
+    const canvas = await domToCanvas(offscreen, { scale, backgroundColor: bg });
+    if (!isCanvasBlank(canvas)) {
+      if (wm?.text.trim()) {
+        const effScale = offscreen.offsetWidth > 0 ? canvas.width / offscreen.offsetWidth : scale;
+        drawWatermark(canvas, wm, effScale);
+      }
+      const blob = await canvasToBlob(canvas);
+      if (blob) return { blob, usedFallback: false };
+    } else {
+      console.warn('[screenshot-selection] mobile DOM rasterize came back blank, using canvas fallback');
+    }
+  } catch (e) {
+    console.warn('[screenshot-selection] mobile DOM rasterize failed, using canvas fallback', e);
+  }
+
+  if (fallbackMarkdown?.trim()) {
+    return { blob: await renderMarkdownCanvasBlob(fallbackMarkdown, wm), usedFallback: true };
+  }
+  // Nothing to redraw from — return the DOM render even if it is blank, rather
+  // than failing outright.
+  return { blob: await domToBlob(offscreen, { scale, type: 'image/png', backgroundColor: bg }), usedFallback: true };
+}
+
+// Detect a blank/empty rasterization by downscaling and checking whether every
+// pixel matches the corner (which sits in the capture wrap's padding, so it is
+// always background). Downscaling keeps the scan cheap while still catching
+// thin content like text, which averages into non-background pixels.
+function isCanvasBlank(canvas: HTMLCanvasElement): boolean {
+  const w = canvas.width;
+  const h = canvas.height;
+  if (w === 0 || h === 0) return true;
+
+  const sw = Math.max(1, Math.min(96, w));
+  const sh = Math.max(1, Math.min(96, h));
+  const sample = document.createElement('canvas');
+  sample.width = sw;
+  sample.height = sh;
+  const ctx = sample.getContext('2d', { willReadFrequently: true });
+  if (!ctx) return false; // cannot inspect → assume real content, keep the render
+
+  ctx.drawImage(canvas, 0, 0, sw, sh);
+
+  let data: Uint8ClampedArray;
+  try {
+    data = ctx.getImageData(0, 0, sw, sh).data;
+  } catch {
+    return false; // tainted/unreadable → keep the render
+  }
+
+  const r0 = data[0];
+  const g0 = data[1];
+  const b0 = data[2];
+  const a0 = data[3];
+  const tol = 10;
+  for (let i = 0; i < data.length; i += 4) {
+    const a = data[i + 3];
+    if (Math.abs(a - a0) > tol) return false; // alpha differs from corner → content
+    if (a < 8) continue; // both effectively transparent
+    if (
+      Math.abs(data[i] - r0) > tol ||
+      Math.abs(data[i + 1] - g0) > tol ||
+      Math.abs(data[i + 2] - b0) > tol
+    ) {
+      return false; // a pixel differs from the background → real content
+    }
+  }
+  return true;
 }
 
 async function renderMarkdownCanvasBlob(markdown: string, wm: WatermarkSettings | null): Promise<Blob | null> {
