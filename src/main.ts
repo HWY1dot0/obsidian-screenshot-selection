@@ -244,7 +244,10 @@ export default class ScreenshotSelectionPlugin extends Plugin {
       document.body.appendChild(offscreen);
 
       await waitForAssets(offscreen);
-      trimOffscreenToContent(offscreen);
+      await nextAnimationFrame();
+      if (!Platform.isMobile) {
+        trimOffscreenToContent(offscreen);
+      }
 
       const inner = offscreen.firstElementChild as HTMLElement;
       const maxHeight = Platform.isMobile ? MOBILE_MAX_CANVAS_HEIGHT : MAX_CANVAS_HEIGHT;
@@ -442,9 +445,9 @@ function createCaptureWrap(mobile: boolean): HTMLDivElement {
   wrap.className = 'screenshot-selection-capture';
   wrap.style.cssText = [
     'position: fixed',
-    'left: -10000px',
-    'top: 0',
-    'z-index: -1',
+    `left: ${mobile ? '0' : '-10000px'}`,
+    `top: ${mobile ? '0' : '0'}`,
+    `z-index: ${mobile ? '-1' : '-1'}`,
     'pointer-events: none',
     'height: auto',
     `width: ${mobile ? 'min(390px, calc(100vw - 32px))' : 'var(--file-line-width, 760px)'}`,
@@ -567,6 +570,10 @@ function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T | null> {
     promise,
     new Promise<null>((resolve) => setTimeout(() => resolve(null), ms)),
   ]);
+}
+
+function nextAnimationFrame(): Promise<void> {
+  return new Promise((resolve) => requestAnimationFrame(() => resolve()));
 }
 
 async function captureWithWatermark(
