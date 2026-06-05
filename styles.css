@@ -1,1 +1,53 @@
-/* screenshot-selection: no global styles. Off-screen capture container styles are applied inline at runtime. */
+/*
+ * screenshot-selection: styles for the off-screen capture container.
+ *
+ * These were previously injected at runtime as a <style> element, which the
+ * Obsidian plugin guidelines disallow. They now live here so Obsidian loads
+ * them, and every rule is scoped to .screenshot-selection-inner so it only
+ * affects the cloned subtree we rasterize — never the rest of the app.
+ *
+ * The capture container's positioning/sizing is dynamic (mobile vs desktop)
+ * and stays inline in main.ts.
+ */
+
+.screenshot-selection-inner,
+.screenshot-selection-inner.markdown-preview-view,
+.screenshot-selection-inner.markdown-rendered,
+.screenshot-selection-inner .markdown-preview-view,
+.screenshot-selection-inner .markdown-rendered,
+.screenshot-selection-inner .cm-content {
+  height: auto !important;
+  min-height: 0 !important;
+  max-height: none !important;
+  padding-bottom: 0 !important;
+  margin-bottom: 0 !important;
+  overflow: visible !important;
+}
+
+.screenshot-selection-inner > :last-child {
+  margin-bottom: 0 !important;
+}
+
+.screenshot-selection-inner pre,
+.screenshot-selection-inner .cm-line,
+.screenshot-selection-inner code {
+  white-space: pre-wrap !important;
+  word-break: break-word;
+}
+
+.screenshot-selection-inner iframe,
+.screenshot-selection-inner embed,
+.screenshot-selection-inner object,
+.screenshot-selection-inner video {
+  display: none !important;
+}
+
+.screenshot-selection-inner img {
+  max-width: 100% !important;
+  height: auto !important;
+}
+
+.screenshot-selection-inner .cm-cursor,
+.screenshot-selection-inner .cm-selectionBackground {
+  display: none !important;
+}
