@@ -1,5 +1,6 @@
 import {
   App,
+  Component,
   Editor,
   EditorPosition,
   MarkdownRenderer,
@@ -10,6 +11,7 @@ import {
   PluginSettingTab,
   Setting,
   TFile,
+  TFolder,
   normalizePath,
 } from 'obsidian';
 import { domToBlob, domToCanvas } from 'modern-screenshot';
@@ -33,6 +35,11 @@ interface CaptureSource {
   offscreen: HTMLDivElement;
   insertAfter?: EditorPosition;
   fallbackMarkdown?: string;
+  // A short-lived Component scoped to this capture's MarkdownRenderer.render call.
+  // Unloaded after rasterization so child renderers (embeds, math, callouts, ...)
+  // are not tied to the plugin's lifetime, which would leak. Only the rendered-
+  // markdown path sets it; the live-DOM clone path leaves it undefined.
+  component?: Component;
 }
 
 interface CaptureResult {
@@ -85,7 +92,7 @@ export default class ScreenshotSelectionPlugin extends Plugin {
   async onload() {
     await this.loadSettings();
 
-    this.registerDomEvent(document, 'selectionchange', () => {
+    this.registerDomEvent(activeDocument, 'selectionchange', () => {
       const sel = window.getSelection();
       if (!sel || sel.rangeCount === 0 || sel.isCollapsed) return;
       const range = sel.getRangeAt(0);
@@ -96,7 +103,7 @@ export default class ScreenshotSelectionPlugin extends Plugin {
 
     this.addCommand({
       id: 'capture-selection-as-png',
-      name: Platform.isMobile ? 'Screenshot selection or block' : 'Screenshot selection to clipboard',
+      name: Platform.isMobile ? 'Capture selection or block' : 'Capture selection to clipboard',
       callback: () => {
         void this.captureActive(Platform.isMobile ? 'auto' : 'clipboard');
       },
@@ -105,7 +112,7 @@ export default class ScreenshotSelectionPlugin extends Plugin {
     if (!Platform.isMobile) {
       this.addCommand({
         id: 'capture-selection-as-png-file',
-        name: 'Screenshot selection or block to file',
+        name: 'Capture selection or block to file',
         callback: () => {
           void this.captureActive('file');
         },
@@ -161,7 +168,7 @@ export default class ScreenshotSelectionPlugin extends Plugin {
         {},
         DEFAULT_SETTINGS.watermark,
         data?.watermark,
-      ) as WatermarkSettings,
+      ),
     };
   }
 
@@ -278,7 +285,7 @@ export default class ScreenshotSelectionPlugin extends Plugin {
 
     try {
       offscreen = source.offscreen;
-      document.body.appendChild(offscreen);
+      activeDocument.body.appendChild(offscreen);
 
       await waitForAssets(offscreen);
       await waitForPaint();
@@ -294,7 +301,7 @@ export default class ScreenshotSelectionPlugin extends Plugin {
         throw new Error(`Selection too tall (${inner.offsetHeight}px). Select less and retry.`);
       }
 
-      const bg = getComputedStyle(document.body).getPropertyValue('--background-primary').trim() || '#ffffff';
+      const bg = getComputedStyle(activeDocument.body).getPropertyValue('--background-primary').trim() || '#ffffff';
       const scale = Platform.isMobile ? MOBILE_SCALE : DESKTOP_SCALE;
       const wm = this.settings.watermark;
       const useWatermark = wm.enabled && wm.text.trim().length > 0;
@@ -322,6 +329,7 @@ export default class ScreenshotSelectionPlugin extends Plugin {
       };
     } finally {
       offscreen?.remove();
+      source.component?.unload();
     }
   }
 
@@ -386,11 +394,21 @@ async function buildSnapshotSource(
   snapshot: MarkdownCaptureSnapshot,
   mobile: boolean,
 ): Promise<CaptureSource> {
-  return {
-    offscreen: await buildMarkdownOffscreen(plugin, snapshot.markdown, snapshot.sourcePath, mobile),
-    insertAfter: snapshot.insertAfter,
-    fallbackMarkdown: snapshot.markdown,
-  };
+  const component = new Component();
+  component.load();
+  try {
+    return {
+      offscreen: await buildMarkdownOffscreen(plugin, snapshot.markdown, snapshot.sourcePath, mobile, component),
+      insertAfter: snapshot.insertAfter,
+      fallbackMarkdown: snapshot.markdown,
+      component,
+    };
+  } catch (e) {
+    // Render failed before the source was handed off — unload now so the
+    // component is not orphaned (its owner only unloads it after capture).
+    component.unload();
+    throw e;
+  }
 }
 
 function getEditorMarkdownSnapshot(
@@ -464,7 +482,6 @@ function buildVisibleViewSource(view: MarkdownView, mobile: boolean): CaptureSou
   const wrap = createCaptureWrap(mobile);
   const inner = createRenderedInner();
   inner.appendChild(root.cloneNode(true));
-  appendCaptureFix(inner);
   wrap.appendChild(inner);
 
   return { offscreen: wrap };
@@ -475,13 +492,16 @@ async function buildMarkdownOffscreen(
   markdown: string,
   sourcePath: string,
   mobile: boolean,
+  component: Component,
 ): Promise<HTMLDivElement> {
   const wrap = createCaptureWrap(mobile);
   const inner = createRenderedInner();
   wrap.appendChild(inner);
 
-  await MarkdownRenderer.render(plugin.app, markdown, inner, sourcePath, plugin);
-  appendCaptureFix(inner);
+  // Render with a short-lived Component (unloaded after capture) rather than the
+  // plugin instance, so transient child renderers are not retained for the
+  // plugin's whole lifetime.
+  await MarkdownRenderer.render(plugin.app, markdown, inner, sourcePath, component);
 
   return wrap;
 }
@@ -535,7 +555,7 @@ function nodeAsElement(node: Node): Element | null {
 }
 
 function createCaptureWrap(mobile: boolean): HTMLDivElement {
-  const wrap = document.createElement('div');
+  const wrap = activeDocument.createElement('div');
   wrap.className = 'screenshot-selection-capture';
   wrap.style.cssText = [
     'position: fixed',
@@ -559,7 +579,7 @@ function createCaptureWrap(mobile: boolean): HTMLDivElement {
 }
 
 function createRenderedInner(): HTMLDivElement {
-  const inner = document.createElement('div');
+  const inner = activeDocument.createElement('div');
   inner.className = 'markdown-preview-view markdown-rendered show-indentation-guide screenshot-selection-inner';
   inner.style.cssText = [
     'width: 100%',
@@ -578,51 +598,25 @@ function buildSelectionOffscreen(range: Range, mobile: boolean): HTMLDivElement 
   const wrap = createCaptureWrap(mobile);
   const inner = createRenderedInner();
   inner.appendChild(range.cloneContents());
-  appendCaptureFix(inner);
 
   wrap.appendChild(inner);
   return wrap;
 }
 
-function appendCaptureFix(inner: HTMLElement): void {
-  const fix = document.createElement('style');
-  fix.textContent = `
-    .screenshot-selection-inner,
-    .screenshot-selection-inner.markdown-preview-view,
-    .screenshot-selection-inner.markdown-rendered,
-    .screenshot-selection-inner .markdown-preview-view,
-    .screenshot-selection-inner .markdown-rendered,
-    .screenshot-selection-inner .cm-content {
-      height: auto !important;
-      min-height: 0 !important;
-      max-height: none !important;
-      padding-bottom: 0 !important;
-      margin-bottom: 0 !important;
-      overflow: visible !important;
-    }
-    .screenshot-selection-inner > :last-child { margin-bottom: 0 !important; }
-    pre, .cm-line, code { white-space: pre-wrap !important; word-break: break-word; }
-    iframe, embed, object, video { display: none !important; }
-    img { max-width: 100% !important; height: auto !important; }
-    .cm-cursor, .cm-selectionBackground { display: none !important; }
-  `;
-  inner.appendChild(fix);
-}
-
 async function waitForAssets(root: HTMLElement): Promise<void> {
   try {
-    await withTimeout(document.fonts.ready, Platform.isMobile ? MOBILE_FONT_TIMEOUT_MS : DESKTOP_FONT_TIMEOUT_MS);
+    await withTimeout(activeDocument.fonts.ready, Platform.isMobile ? MOBILE_FONT_TIMEOUT_MS : DESKTOP_FONT_TIMEOUT_MS);
   } catch {
     /* fonts.ready can reject in odd states; not fatal */
   }
-  const imgs = Array.from(root.querySelectorAll('img')) as HTMLImageElement[];
+  const imgs = Array.from(root.querySelectorAll('img'));
   const imageTimeout = Platform.isMobile ? MOBILE_IMAGE_TIMEOUT_MS : DESKTOP_IMAGE_TIMEOUT_MS;
   await Promise.all(
     imgs.map((img) => {
-      if (img.complete && img.naturalWidth > 0) return null;
+      if (img.complete && img.naturalWidth > 0) return Promise.resolve(null);
       return Promise.race([
         img.decode().catch(() => null),
-        new Promise((r) => setTimeout(r, imageTimeout)),
+        new Promise((r) => window.setTimeout(r, imageTimeout)),
       ]);
     }),
   );
@@ -635,10 +629,9 @@ function trimOffscreenToContent(offscreen: HTMLElement): void {
   const contentHeight = measureContentHeight(inner);
   if (contentHeight <= 0) return;
 
+  // min-height / max-height / overflow are handled by styles.css (scoped to
+  // .screenshot-selection-inner); only the measured height is dynamic.
   inner.style.height = `${contentHeight}px`;
-  inner.style.minHeight = '0';
-  inner.style.maxHeight = 'none';
-  inner.style.overflow = 'visible';
 }
 
 function measureContentHeight(container: HTMLElement): number {
@@ -662,7 +655,7 @@ function measureContentHeight(container: HTMLElement): number {
 function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T | null> {
   return Promise.race([
     promise,
-    new Promise<null>((resolve) => setTimeout(() => resolve(null), ms)),
+    new Promise<null>((resolve) => window.setTimeout(() => resolve(null), ms)),
   ]);
 }
 
@@ -674,7 +667,7 @@ async function waitForPaint(): Promise<void> {
 }
 
 function nextAnimationFrame(): Promise<void> {
-  return new Promise((resolve) => requestAnimationFrame(() => resolve()));
+  return new Promise((resolve) => window.requestAnimationFrame(() => resolve()));
 }
 
 interface CanvasTheme {
@@ -795,7 +788,7 @@ async function renderMarkdownCanvasBlob(markdown: string, wm: WatermarkSettings 
   const paddingX = 22;
   const paddingY = 20;
   const contentWidth = cssWidth - paddingX * 2;
-  const measureCanvas = document.createElement('canvas');
+  const measureCanvas = activeDocument.createElement('canvas');
   const measureCtx = measureCanvas.getContext('2d');
   if (!measureCtx) throw new Error('Canvas unavailable');
 
@@ -803,7 +796,7 @@ async function renderMarkdownCanvasBlob(markdown: string, wm: WatermarkSettings 
   const lastRow = rows[rows.length - 1];
   const cssHeight = Math.max(80, Math.ceil((lastRow ? lastRow.y + lastRow.lineHeight : paddingY) + paddingY));
 
-  const canvas = document.createElement('canvas');
+  const canvas = activeDocument.createElement('canvas');
   canvas.width = Math.ceil(cssWidth * scale);
   canvas.height = Math.ceil(cssHeight * scale);
 
@@ -1021,9 +1014,9 @@ function breakLongCanvasWord(ctx: CanvasRenderingContext2D, word: string, maxWid
 
 function stripInlineMarkdown(text: string): string {
   return text
-    .replace(/!\[\[([^\]|]+)(?:\|([^\]]+))?\]\]/g, (_m, target, alias) => `[image: ${alias || target}]`)
-    .replace(/\[\[([^\]|]+)(?:\|([^\]]+))?\]\]/g, (_m, target, alias) => alias || target)
-    .replace(/!\[([^\]]*)\]\([^)]+\)/g, (_m, alt) => alt ? `[image: ${alt}]` : '[image]')
+    .replace(/!\[\[([^\]|]+)(?:\|([^\]]+))?\]\]/g, (_m: string, target: string, alias?: string) => `[image: ${alias || target}]`)
+    .replace(/\[\[([^\]|]+)(?:\|([^\]]+))?\]\]/g, (_m: string, target: string, alias?: string) => alias || target)
+    .replace(/!\[([^\]]*)\]\([^)]+\)/g, (_m: string, alt: string) => alt ? `[image: ${alt}]` : '[image]')
     .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
     .replace(/`([^`]+)`/g, '$1')
     .replace(/(\*\*|__)(.*?)\1/g, '$2')
@@ -1046,7 +1039,7 @@ function getCanvasTheme(): CanvasTheme {
 }
 
 function cssVar(name: string, fallback: string): string {
-  return getComputedStyle(document.body).getPropertyValue(name).trim() || fallback;
+  return getComputedStyle(activeDocument.body).getPropertyValue(name).trim() || fallback;
 }
 
 function canvasToBlob(canvas: HTMLCanvasElement): Promise<Blob | null> {
@@ -1075,7 +1068,7 @@ function drawWatermark(canvas: HTMLCanvasElement, wm: WatermarkSettings, scale: 
   const W = canvas.width;
   const H = canvas.height;
   const fontPx = Math.max(1, wm.fontSize) * scale;
-  const fontFamily = getComputedStyle(document.body).getPropertyValue('--font-text').trim() || 'sans-serif';
+  const fontFamily = getComputedStyle(activeDocument.body).getPropertyValue('--font-text').trim() || 'sans-serif';
 
   ctx.save();
   ctx.globalAlpha = clamp(wm.opacity, 0, 1);
@@ -1112,7 +1105,7 @@ function drawWatermark(canvas: HTMLCanvasElement, wm: WatermarkSettings, scale: 
 function resolveWatermarkColor(color: string): string {
   const c = color.trim();
   if (c) return c;
-  const muted = getComputedStyle(document.body).getPropertyValue('--text-muted').trim();
+  const muted = getComputedStyle(activeDocument.body).getPropertyValue('--text-muted').trim();
   return muted || '#888888';
 }
 
@@ -1137,7 +1130,9 @@ async function ensureFolder(app: App, folderPath: string): Promise<void> {
 
   for (const part of parts) {
     current = current ? `${current}/${part}` : part;
-    if (!app.vault.getFolderByPath(current)) {
+    // getAbstractFileByPath (since 0.11.11) instead of getFolderByPath (1.5.7)
+    // to stay within the declared minAppVersion (1.5.0).
+    if (!(app.vault.getAbstractFileByPath(current) instanceof TFolder)) {
       await app.vault.createFolder(current);
     }
   }
@@ -1176,7 +1171,7 @@ function insertFileLink(view: MarkdownView, file: TFile, insertAfter?: EditorPos
 }
 
 function sanitizeFileName(name: string): string {
-  return name.replace(/[\\/:*?"<>|#^\[\]]+/g, '-').replace(/\s+/g, ' ').trim() || 'note';
+  return name.replace(/[\\/:*?"<>|#^[\]]+/g, '-').replace(/\s+/g, ' ').trim() || 'note';
 }
 
 function timestampForFile(): string {
@@ -1194,6 +1189,19 @@ function timestampForFile(): string {
   ].join('');
 }
 
+interface ElectronClipboardModule {
+  clipboard?: { writeImage(image: unknown): void };
+  nativeImage?: { createFromBuffer(buffer: Buffer): unknown };
+}
+
+// Desktop-only fallback: reach Electron's clipboard through require('electron')
+// without an `any` cast (require is not in the renderer's typed globals).
+function getElectronClipboardModule(): ElectronClipboardModule | null {
+  const req = (window as unknown as { require?: (id: string) => unknown }).require;
+  if (typeof req !== 'function') return null;
+  return req('electron') as ElectronClipboardModule;
+}
+
 async function writeBlobToClipboard(blob: Blob): Promise<void> {
   try {
     await navigator.clipboard.write([new ClipboardItem({ [blob.type]: blob })]);
@@ -1202,8 +1210,8 @@ async function writeBlobToClipboard(blob: Blob): Promise<void> {
     console.warn('[screenshot-selection] navigator.clipboard.write failed, falling back to Electron', e);
   }
 
-  const electron = (window as any).require?.('electron');
-  if (!electron?.clipboard || !electron?.nativeImage) {
+  const electron = getElectronClipboardModule();
+  if (!electron?.clipboard || !electron.nativeImage) {
     throw new Error('Clipboard API unavailable');
   }
   const buf = Buffer.from(await blob.arrayBuffer());
