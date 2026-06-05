@@ -1,0 +1,51 @@
+name: Release Obsidian plugin
+
+# Push a tag that matches the manifest version (e.g. `git tag 0.2.10 && git push --tags`)
+# to build the plugin, attach signed build-provenance attestations, and create the
+# GitHub release with the assets Obsidian expects (main.js, manifest.json, styles.css).
+
+on:
+  push:
+    tags:
+      - "*"
+
+permissions:
+  contents: write       # create the release and upload assets
+  id-token: write       # required by attest-build-provenance
+  attestations: write   # write the artifact attestations
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20.x"
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Build
+        run: npm run build
+
+      - name: Generate artifact attestations
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            main.js
+            manifest.json
+            styles.css
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          gh release create "$tag" \
+            --title "$tag" \
+            --notes "See the changelog for details on $tag." \
+            main.js manifest.json styles.css
