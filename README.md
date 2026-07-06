@@ -4,6 +4,8 @@ Capture note content in Obsidian as a PNG. On desktop, selected rendered content
 
 The image inherits your current Obsidian theme (fonts, colors, callouts, code highlighting), so the output looks the way the note looks on screen.
 
+![Screenshot Selection demo — select content, run the command, paste a theme-faithful PNG](./images/demo.gif)
+
 ## Features
 
 - Works in Reading View and Live Preview
@@ -16,7 +18,7 @@ The image inherits your current Obsidian theme (fonts, colors, callouts, code hi
 
 ## Install
 
-### From the Community Plugins browser (after the plugin is accepted)
+### From the Community Plugins browser
 
 1. Settings → Community plugins → Browse
 2. Search for "Screenshot Selection"
@@ -34,7 +36,7 @@ The image inherits your current Obsidian theme (fonts, colors, callouts, code hi
 
 1. Open a note, switch to Reading View or Live Preview
 2. Select the content you want to capture (drag-select with the mouse)
-3. Open the command palette (`Cmd-P` / `Ctrl-P`) and run **Screenshot selection to clipboard**
+3. Open the command palette (`Cmd-P` / `Ctrl-P`) and run **Capture selection to clipboard**
 4. Paste (`Cmd-V` / `Ctrl-V`) into any app that accepts images
 
 Assign a hotkey via Settings → Hotkeys for one-keystroke capture.
@@ -43,7 +45,7 @@ Assign a hotkey via Settings → Hotkeys for one-keystroke capture.
 
 1. Open a note — Reading View gives the most faithful result
 2. Select the text you want to capture (or, in the editor, place the cursor inside a block to capture the whole block)
-3. Tap the camera ribbon action, use the editor menu item, or run **Screenshot selection or block**
+3. Tap the camera ribbon action, use the editor menu item, or run **Capture selection or block to file**
 4. If clipboard writing succeeds, paste the PNG into another app
 5. If iOS rejects clipboard writing, the PNG is saved under `Attachments/Screenshots/`; when possible, an image embed is inserted below the captured block
 
@@ -80,6 +82,13 @@ The build copies `main.js`, `manifest.json`, and `styles.css` to `<OBSIDIAN_VAUL
 ## Network usage
 
 This plugin makes no network requests of its own. It uses the `modern-screenshot` library, which — when rendering a selection that contains externally-hosted images (e.g. `<img src="https://...">`) — may have your browser fetch those images so they can be embedded in the capture. No data is sent to any third-party server by the plugin.
+
+## More plugins by HWY1dot0
+
+- [Calendar Hub](https://github.com/HWY1dot0/calendar-hub) — one calendar that surfaces every note from a given day, in any folder.
+- [Copy for Email](https://github.com/HWY1dot0/obsidian-copy-for-email) — copy notes as rich text that survives pasting into Gmail, Outlook and Apple Mail.
+
+If this plugin helps your workflow, you can [buy me a coffee](https://www.buymeacoffee.com/hwy1dot0).
 
 ## License
 
