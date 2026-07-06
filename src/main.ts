@@ -716,21 +716,35 @@ function freezeLineHeights(root: HTMLElement): void {
 // the capture wrap keeps the source line breaks instead of the fixed 760/900px.
 function measureContentWidth(range: Range): number | undefined {
   const win = range.startContainer.ownerDocument?.defaultView ?? window;
-  const start = range.startContainer;
+  // Walk up from the common ancestor, not range.startContainer: the start can
+  // sit inside a shrink-wrapped block that is NOT the content column. A
+  // selection wholly inside a callout begins in `.callout-title-inner`, which
+  // hugs the title text (~65px); measuring it collapses the capture into a
+  // one-glyph-per-line sliver. The common ancestor is by definition wide enough
+  // to hold the whole selection.
+  const common = range.commonAncestorContainer;
+  // The selection's painted width is a floor: the container we pick must be at
+  // least this wide, so we walk past any ancestor still narrower than the
+  // selection (e.g. a shrink-wrapped flex/grid item) up to the real column.
+  const needed = Math.round(range.getBoundingClientRect().width);
   let el: Element | null =
-    start.nodeType === Node.ELEMENT_NODE ? (start as Element) : start.parentElement;
+    common.nodeType === Node.ELEMENT_NODE ? (common as Element) : common.parentElement;
+  let firstBlock: number | undefined;
   while (el) {
     const display = win.getComputedStyle(el).display;
     // Skip every inline-* variant: a selection can start inside inline-flex
     // widgets (e.g. the live-preview list bullet), whose width is not the
     // content column's.
     if (!display.startsWith('inline') && display !== 'contents') {
-      const width = el.getBoundingClientRect().width;
-      return width > 0 ? Math.round(width) : undefined;
+      const width = Math.round(el.getBoundingClientRect().width);
+      if (width > 0) {
+        if (firstBlock === undefined) firstBlock = width;
+        if (width >= needed - 1) return width;
+      }
     }
     el = el.parentElement;
   }
-  return undefined;
+  return firstBlock;
 }
 
 function measureContentHeight(container: HTMLElement): number {
