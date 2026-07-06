@@ -51,3 +51,41 @@
 .screenshot-selection-inner .cm-selectionBackground {
   display: none !important;
 }
+
+/*
+ * CM6 clones are wrapped in replicas of their real editor ancestors
+ * (see buildEditorContextHost) so editor-scoped CSS keeps applying to them.
+ * The replicas are there purely for CSS scope: strip the layout duties the
+ * real containers have in the app — the capture wrap owns sizing and padding,
+ * and nothing inside a capture may scroll or clip.
+ */
+.screenshot-selection-inner .markdown-source-view,
+.screenshot-selection-inner .cm-editor,
+.screenshot-selection-inner .cm-scroller,
+.screenshot-selection-inner .cm-sizer,
+.screenshot-selection-inner .cm-contentContainer {
+  display: block !important;
+  height: auto !important;
+  min-height: 0 !important;
+  max-height: none !important;
+  width: 100% !important;
+  min-width: 0 !important;
+  max-width: none !important;
+  padding: 0 !important;
+  margin: 0 !important;
+  overflow: visible !important;
+  contain: none !important;
+}
+
+/*
+ * In the live editor .cm-content is a flex item stretched by flex-grow; with
+ * the replica chain flattened to block flow that stretch is gone and its
+ * stylesheet width computes to 0, wrapping every character. The wrap owns
+ * sizing, so make the clone's content fill it.
+ */
+.screenshot-selection-inner .cm-content {
+  width: 100% !important;
+  min-width: 0 !important;
+  max-width: none !important;
+  box-sizing: border-box !important;
+}
