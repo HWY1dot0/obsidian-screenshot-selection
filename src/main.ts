@@ -699,7 +699,7 @@ function freezeLineHeights(root: HTMLElement): void {
   const win = root.ownerDocument.defaultView ?? window;
   const els: HTMLElement[] = [root];
   root.querySelectorAll('*').forEach((el) => {
-    if (el instanceof HTMLElement) els.push(el);
+    if (el.instanceOf(HTMLElement)) els.push(el);
   });
   for (const el of els) {
     const cs = win.getComputedStyle(el);
@@ -1288,9 +1288,13 @@ function timestampForFile(): string {
   ].join('');
 }
 
+// Electron's nativeImage needs a real Node Buffer; Obsidian's renderer exposes
+// the global, but this browser-typed project has no Node typings for it.
+declare const Buffer: { from(data: ArrayBuffer): Uint8Array };
+
 interface ElectronClipboardModule {
   clipboard?: { writeImage(image: unknown): void };
-  nativeImage?: { createFromBuffer(buffer: Buffer): unknown };
+  nativeImage?: { createFromBuffer(buffer: Uint8Array): unknown };
 }
 
 // Desktop-only fallback: reach Electron's clipboard through require('electron')
