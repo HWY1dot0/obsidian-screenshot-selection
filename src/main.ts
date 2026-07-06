@@ -294,6 +294,7 @@ export default class ScreenshotSelectionPlugin extends Plugin {
       // the content. The offscreen is attached and visible on mobile, so
       // getBoundingClientRect-based measurement is valid here.
       trimOffscreenToContent(offscreen);
+      freezeLineHeights(offscreen);
 
       const inner = offscreen.firstElementChild as HTMLElement;
       const maxHeight = Platform.isMobile ? MOBILE_MAX_CANVAS_HEIGHT : MAX_CANVAS_HEIGHT;
@@ -442,8 +443,9 @@ function getEditorMarkdownSnapshot(
 function buildRangeSource(range: Range, mobile: boolean): CaptureSource | null {
   const anchor = nodeAsElement(range.commonAncestorContainer);
   if (!anchor?.closest(PREVIEW_SELECTORS)) return null;
+  const contentWidth = mobile ? undefined : measureContentWidth(range);
   return {
-    offscreen: buildSelectionOffscreen(range, mobile),
+    offscreen: buildSelectionOffscreen(range, mobile, contentWidth),
     fallbackMarkdown: range.toString().replace(/\n{3,}/g, '\n\n').trim(),
   };
 }
@@ -468,9 +470,10 @@ function buildDomSelectionSource(view: MarkdownView, mobile: boolean, quiet = fa
   }
 
   const fallbackMarkdown = range.toString().replace(/\n{3,}/g, '\n\n').trim();
+  const contentWidth = mobile ? undefined : measureContentWidth(range);
 
   return {
-    offscreen: buildSelectionOffscreen(range, mobile),
+    offscreen: buildSelectionOffscreen(range, mobile, contentWidth),
     fallbackMarkdown,
   };
 }
@@ -480,6 +483,16 @@ function buildVisibleViewSource(view: MarkdownView, mobile: boolean): CaptureSou
   if (!root) return null;
 
   const wrap = createCaptureWrap(mobile);
+
+  if (root.classList.contains('cm-content') && root.parentElement) {
+    const inner = createRenderedInner('screenshot-selection-inner');
+    const { outer, host } = buildEditorContextHost(root.parentElement);
+    host.appendChild(root.cloneNode(true));
+    inner.appendChild(outer);
+    wrap.appendChild(inner);
+    return { offscreen: wrap };
+  }
+
   const inner = createRenderedInner();
   inner.appendChild(root.cloneNode(true));
   wrap.appendChild(inner);
@@ -554,7 +567,7 @@ function nodeAsElement(node: Node): Element | null {
   return node.nodeType === Node.ELEMENT_NODE ? (node as Element) : node.parentElement;
 }
 
-function createCaptureWrap(mobile: boolean): HTMLDivElement {
+function createCaptureWrap(mobile: boolean, contentWidth?: number): HTMLDivElement {
   const wrap = activeDocument.createElement('div');
   wrap.className = 'screenshot-selection-capture';
   wrap.style.cssText = [
@@ -564,8 +577,8 @@ function createCaptureWrap(mobile: boolean): HTMLDivElement {
     `z-index: ${mobile ? '2147483647' : '-1'}`,
     'pointer-events: none',
     'height: auto',
-    `width: ${mobile ? 'min(390px, calc(100vw - 32px))' : 'var(--file-line-width, 760px)'}`,
-    `max-width: ${mobile ? '390px' : '900px'}`,
+    `width: ${mobile ? 'min(390px, calc(100vw - 32px))' : (contentWidth != null ? Math.round(contentWidth) + 64 + 'px' : 'var(--file-line-width, 760px)')}`,
+    `max-width: ${mobile ? '390px' : (contentWidth != null ? 'none' : '900px')}`,
     'background: var(--background-primary)',
     'color: var(--text-normal)',
     `padding: ${mobile ? '18px 20px' : '28px 32px'}`,
@@ -578,9 +591,11 @@ function createCaptureWrap(mobile: boolean): HTMLDivElement {
   return wrap;
 }
 
-function createRenderedInner(): HTMLDivElement {
+function createRenderedInner(
+  className = 'markdown-preview-view markdown-rendered show-indentation-guide screenshot-selection-inner',
+): HTMLDivElement {
   const inner = activeDocument.createElement('div');
-  inner.className = 'markdown-preview-view markdown-rendered show-indentation-guide screenshot-selection-inner';
+  inner.className = className;
   inner.style.cssText = [
     'width: 100%',
     'height: auto',
@@ -594,8 +609,51 @@ function createRenderedInner(): HTMLDivElement {
   return inner;
 }
 
-function buildSelectionOffscreen(range: Range, mobile: boolean): HTMLDivElement {
-  const wrap = createCaptureWrap(mobile);
+// Replicate the classes and inline styles of the editor containers between
+// `deepest` and the enclosing .markdown-source-view, so a detached CM6 clone
+// keeps resolving the same CSS: Obsidian scopes editor rules to that chain
+// (.markdown-source-view.mod-cm6, .is-live-preview, .cm-s-obsidian) and
+// CodeMirror scopes its base theme to generated classes on .cm-editor.
+// Without it the clone sits under reading-view classes, whose rules (e.g.
+// `.markdown-rendered .list-bullet { float: inline-start }`) restyle editor
+// widgets — bullets, checkboxes — onto the text.
+function buildEditorContextHost(deepest: Element): { outer: HTMLElement; host: HTMLElement } {
+  const chain: Element[] = [];
+  let el: Element | null = deepest;
+  for (let depth = 0; el && depth < 8; depth += 1) {
+    chain.push(el);
+    if (el.classList.contains('markdown-source-view')) break;
+    el = el.parentElement;
+  }
+
+  let outer: HTMLElement | null = null;
+  let host: HTMLElement | null = null;
+  for (const source of chain.reverse()) {
+    const replica = activeDocument.createElement('div');
+    replica.className = source.className;
+    const inline = source.getAttribute('style');
+    if (inline) replica.setAttribute('style', inline);
+    if (host) host.appendChild(replica);
+    outer = outer ?? replica;
+    host = replica;
+  }
+
+  return { outer: outer as HTMLElement, host: host as HTMLElement };
+}
+
+function buildSelectionOffscreen(range: Range, mobile: boolean, contentWidth?: number): HTMLDivElement {
+  const wrap = createCaptureWrap(mobile, contentWidth);
+  const cmContent = nodeAsElement(range.commonAncestorContainer)?.closest('.cm-content');
+
+  if (cmContent) {
+    const inner = createRenderedInner('screenshot-selection-inner');
+    const { outer, host } = buildEditorContextHost(cmContent);
+    host.appendChild(range.cloneContents());
+    inner.appendChild(outer);
+    wrap.appendChild(inner);
+    return wrap;
+  }
+
   const inner = createRenderedInner();
   inner.appendChild(range.cloneContents());
 
@@ -632,6 +690,47 @@ function trimOffscreenToContent(offscreen: HTMLElement): void {
   // min-height / max-height / overflow are handled by styles.css (scoped to
   // .screenshot-selection-inner); only the measured height is dynamic.
   inner.style.height = `${contentHeight}px`;
+}
+
+// Pin every element's line-height to an explicit px value before capture.
+// modern-screenshot drops inherited/CSS-variable line-heights when cloning
+// into <foreignObject>, falling back to `normal` and collapsing CJK lines.
+function freezeLineHeights(root: HTMLElement): void {
+  const win = root.ownerDocument.defaultView ?? window;
+  const els: HTMLElement[] = [root];
+  root.querySelectorAll('*').forEach((el) => {
+    if (el.instanceOf(HTMLElement)) els.push(el);
+  });
+  for (const el of els) {
+    const cs = win.getComputedStyle(el);
+    let lineHeight = cs.lineHeight;
+    if (!lineHeight || lineHeight === 'normal') {
+      const fontSize = parseFloat(cs.fontSize) || 16;
+      lineHeight = `${Math.round(fontSize * 1.5 * 100) / 100}px`;
+    }
+    el.style.setProperty('line-height', lineHeight, 'important');
+  }
+}
+
+// Measure the on-screen column width of the block containing the selection so
+// the capture wrap keeps the source line breaks instead of the fixed 760/900px.
+function measureContentWidth(range: Range): number | undefined {
+  const win = range.startContainer.ownerDocument?.defaultView ?? window;
+  const start = range.startContainer;
+  let el: Element | null =
+    start.nodeType === Node.ELEMENT_NODE ? (start as Element) : start.parentElement;
+  while (el) {
+    const display = win.getComputedStyle(el).display;
+    // Skip every inline-* variant: a selection can start inside inline-flex
+    // widgets (e.g. the live-preview list bullet), whose width is not the
+    // content column's.
+    if (!display.startsWith('inline') && display !== 'contents') {
+      const width = el.getBoundingClientRect().width;
+      return width > 0 ? Math.round(width) : undefined;
+    }
+    el = el.parentElement;
+  }
+  return undefined;
 }
 
 function measureContentHeight(container: HTMLElement): number {
@@ -1189,9 +1288,13 @@ function timestampForFile(): string {
   ].join('');
 }
 
+// Electron's nativeImage needs a real Node Buffer; Obsidian's renderer exposes
+// the global, but this browser-typed project has no Node typings for it.
+declare const Buffer: { from(data: ArrayBuffer): Uint8Array };
+
 interface ElectronClipboardModule {
   clipboard?: { writeImage(image: unknown): void };
-  nativeImage?: { createFromBuffer(buffer: Buffer): unknown };
+  nativeImage?: { createFromBuffer(buffer: Uint8Array): unknown };
 }
 
 // Desktop-only fallback: reach Electron's clipboard through require('electron')

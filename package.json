@@ -1,6 +1,6 @@
 {
   "name": "obsidian-screenshot-selection",
-  "version": "0.2.10",
+  "version": "0.2.11",
   "description": "Capture selected content in Obsidian as a PNG.",
   "main": "main.js",
   "scripts": {
