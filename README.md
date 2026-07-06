@@ -4,7 +4,7 @@ Capture note content in Obsidian as a PNG. On desktop, selected rendered content
 
 The image inherits your current Obsidian theme (fonts, colors, callouts, code highlighting), so the output looks the way the note looks on screen.
 
-![Screenshot Selection demo — select content, run the command, paste a theme-faithful PNG](./images/demo.gif)
+![Screenshot Selection demo — select content, run the command, paste a theme-faithful PNG](https://raw.githubusercontent.com/HWY1dot0/obsidian-screenshot-selection/main/images/demo.gif)
 
 ## Features
 
