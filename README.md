@@ -1,3 +1,5 @@
+**English** | [简体中文](README.zh-CN.md)
+
 # Screenshot Selection
 
 Capture note content in Obsidian as a PNG. On desktop, selected rendered content is copied to the system clipboard. On mobile, selected text or the current markdown block is copied to the clipboard when possible, with a vault file fallback.
