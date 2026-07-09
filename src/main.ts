@@ -14,7 +14,7 @@ import {
   TFolder,
   normalizePath,
 } from 'obsidian';
-import { domToBlob, domToCanvas } from 'modern-screenshot';
+import { domToCanvas } from 'modern-screenshot';
 
 const PREVIEW_SELECTORS = '.markdown-preview-view, .markdown-reading-view, .cm-content';
 const MAX_CANVAS_HEIGHT = 30000;
@@ -314,9 +314,12 @@ export default class ScreenshotSelectionPlugin extends Plugin {
         blob = mobile.blob;
         renderMode = mobile.usedFallback ? 'fallback' : 'dom';
       } else {
-        blob = useWatermark
-          ? await captureWithWatermark(offscreen, bg, wm, scale)
-          : await domToBlob(offscreen, { scale, type: 'image/png', backgroundColor: bg });
+        const canvas = await renderThemedCanvas(offscreen, bg, scale);
+        if (useWatermark) {
+          const effScale = offscreen.offsetWidth > 0 ? canvas.width / offscreen.offsetWidth : scale;
+          drawWatermark(canvas, wm, effScale);
+        }
+        blob = await canvasToBlob(canvas);
       }
 
       if (!blob) {
@@ -765,6 +768,128 @@ function measureContentHeight(container: HTMLElement): number {
   return Math.ceil(bottom);
 }
 
+// Elements whose height is intrinsic rather than a product of text flow; their
+// pinned height must survive unpinClonedTextHeights.
+const KEEP_PINNED_HEIGHT_TAGS = new Set([
+  'IMG', 'VIDEO', 'CANVAS', 'SVG', 'IFRAME', 'EMBED', 'OBJECT',
+  'INPUT', 'TEXTAREA', 'SELECT', 'PROGRESS', 'METER', 'HR',
+]);
+
+// modern-screenshot pins every cloned element's used width AND height as
+// inline styles (width/height are excluded from its default-style diff on
+// purpose). Text metrics inside the rasterized <foreignObject> are not
+// bit-identical to the live document, so a CJK/latin mixed line can wrap one
+// glyph earlier there; with the block's height pinned, the extra line
+// overflows and the next block paints over it — paragraphs overlap at their
+// boundary. Un-pin height on text-bearing containers so reflow grows the
+// block and pushes content down instead. Width stays pinned: it is what
+// preserves the source column and line breaks.
+function unpinClonedTextHeights(node: Node): void {
+  if (!node.instanceOf(HTMLElement)) return;
+  if (!node.style.height && !node.style.getPropertyValue('block-size')) return;
+  if (KEEP_PINNED_HEIGHT_TAGS.has(node.tagName)) return;
+  // Empty containers (spacers, icons) keep their pinned height — only text
+  // flow can reflow, so only text-bearing blocks need to grow.
+  if (!node.textContent || !node.textContent.trim()) return;
+  node.style.removeProperty('height');
+  // block-size is the logical alias of height in horizontal writing modes and
+  // is pinned alongside it (only width/height sit on modern-screenshot's
+  // exclusion list); leaving it keeps the block clamped even with height gone.
+  node.style.removeProperty('block-size');
+}
+
+// With heights un-pinned the content may end lower than the measured wrap, so
+// the canvas is rendered with bottom headroom and cropped back to the actual
+// painted content afterwards.
+function canvasHeadroom(cssHeight: number): number {
+  return Math.min(600, Math.max(96, Math.round(cssHeight * 0.08)));
+}
+
+// Scan up from the bottom for the last non-background row and crop the canvas
+// to it plus the wrap's own bottom padding. The bottom-right corner sits in
+// the headroom, so it is always background; compare against that pixel.
+function cropCanvasBottom(canvas: HTMLCanvasElement, padBottomDevice: number): HTMLCanvasElement {
+  const w = canvas.width;
+  const h = canvas.height;
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  if (!ctx || w === 0 || h === 0) return canvas;
+
+  let ref: Uint8ClampedArray;
+  try {
+    ref = ctx.getImageData(w - 1, h - 1, 1, 1).data;
+  } catch {
+    return canvas;
+  }
+  const tol = 12;
+
+  // Read in chunks of rows, not row-by-row: each getImageData forces a full
+  // GPU readback (the canvas came from modern-screenshot without
+  // willReadFrequently, and that flag is fixed at first getContext), so
+  // per-row reads take multi-second worst cases on tall captures.
+  const chunkRows = 256;
+  let contentBottom = 0;
+  outer: for (let yEnd = h; yEnd > 0; yEnd -= chunkRows) {
+    const yStart = Math.max(0, yEnd - chunkRows);
+    let data: Uint8ClampedArray;
+    try {
+      data = ctx.getImageData(0, yStart, w, yEnd - yStart).data;
+    } catch {
+      return canvas;
+    }
+    const rowBytes = w * 4;
+    for (let y = yEnd - 1; y >= yStart; y--) {
+      const base = (y - yStart) * rowBytes;
+      for (let i = base; i < base + rowBytes; i += 4) {
+        if (
+          Math.abs(data[i] - ref[0]) > tol ||
+          Math.abs(data[i + 1] - ref[1]) > tol ||
+          Math.abs(data[i + 2] - ref[2]) > tol ||
+          Math.abs(data[i + 3] - ref[3]) > tol
+        ) {
+          contentBottom = y + 1;
+          break outer;
+        }
+      }
+    }
+  }
+  if (contentBottom === 0) return canvas; // uniform canvas — leave it to the blank check
+
+  const target = Math.min(h, contentBottom + Math.round(padBottomDevice));
+  if (target >= h) return canvas;
+
+  const out = canvas.ownerDocument.createElement('canvas');
+  out.width = w;
+  out.height = target;
+  const outCtx = out.getContext('2d');
+  if (!outCtx) return canvas;
+  outCtx.drawImage(canvas, 0, 0, w, target, 0, 0, w, target);
+  return out;
+}
+
+// Shared themed rasterizer: render with un-pinned text heights into a canvas
+// with bottom headroom, then crop back to the painted content.
+async function renderThemedCanvas(
+  offscreen: HTMLElement,
+  bg: string,
+  scale: number,
+): Promise<HTMLCanvasElement> {
+  const rect = offscreen.getBoundingClientRect();
+  const cssWidth = Math.ceil(rect.width);
+  const cssHeight = Math.ceil(rect.height);
+  const padBottomCss = parseFloat(getComputedStyle(offscreen).paddingBottom) || 0;
+
+  const canvas = await domToCanvas(offscreen, {
+    scale,
+    backgroundColor: bg,
+    width: cssWidth,
+    height: cssHeight + canvasHeadroom(cssHeight),
+    onCloneEachNode: unpinClonedTextHeights,
+  });
+
+  const effScale = cssWidth > 0 ? canvas.width / cssWidth : scale;
+  return cropCanvasBottom(canvas, padBottomCss * effScale);
+}
+
 function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T | null> {
   return Promise.race([
     promise,
@@ -820,7 +945,7 @@ async function renderMobileCaptureBlob(
   fallbackMarkdown?: string,
 ): Promise<{ blob: Blob | null; usedFallback: boolean }> {
   try {
-    const canvas = await domToCanvas(offscreen, { scale, backgroundColor: bg });
+    const canvas = await renderThemedCanvas(offscreen, bg, scale);
     if (!isCanvasBlank(canvas)) {
       if (wm?.text.trim()) {
         const effScale = offscreen.offsetWidth > 0 ? canvas.width / offscreen.offsetWidth : scale;
@@ -840,7 +965,7 @@ async function renderMobileCaptureBlob(
   }
   // Nothing to redraw from — return the DOM render even if it is blank, rather
   // than failing outright.
-  return { blob: await domToBlob(offscreen, { scale, type: 'image/png', backgroundColor: bg }), usedFallback: true };
+  return { blob: await canvasToBlob(await renderThemedCanvas(offscreen, bg, scale)), usedFallback: true };
 }
 
 // Detect a blank/empty rasterization by downscaling and checking whether every
@@ -1157,20 +1282,6 @@ function cssVar(name: string, fallback: string): string {
 
 function canvasToBlob(canvas: HTMLCanvasElement): Promise<Blob | null> {
   return new Promise((resolve) => canvas.toBlob((blob) => resolve(blob), 'image/png'));
-}
-
-async function captureWithWatermark(
-  offscreen: HTMLElement,
-  bg: string,
-  wm: WatermarkSettings,
-  scale: number,
-): Promise<Blob | null> {
-  const canvas = await domToCanvas(offscreen, { scale, backgroundColor: bg });
-  const effScale = offscreen.offsetWidth > 0 ? canvas.width / offscreen.offsetWidth : scale;
-  drawWatermark(canvas, wm, effScale);
-  return await new Promise<Blob | null>((resolve) =>
-    canvas.toBlob((b) => resolve(b), 'image/png'),
-  );
 }
 
 function drawWatermark(canvas: HTMLCanvasElement, wm: WatermarkSettings, scale: number): void {
