@@ -201,7 +201,7 @@ export default class ScreenshotSelectionPlugin extends Plugin {
 
   private async capture(view: MarkdownView, output: CaptureOutput) {
     const sourcePromise = output === 'clipboard'
-      ? Promise.resolve(buildDomSelectionSource(view, Platform.isMobile))
+      ? buildClipboardSource(this, view)
       : buildFileSource(this, view);
 
     await this.captureFromSource(view, sourcePromise, output);
@@ -285,6 +285,7 @@ export default class ScreenshotSelectionPlugin extends Plugin {
 
     try {
       offscreen = source.offscreen;
+      removeCaptureScrollLayout(offscreen);
       activeDocument.body.appendChild(offscreen);
 
       await waitForAssets(offscreen);
@@ -344,6 +345,15 @@ export default class ScreenshotSelectionPlugin extends Plugin {
   }
 }
 
+async function buildClipboardSource(plugin: ScreenshotSelectionPlugin, view: MarkdownView): Promise<CaptureSource | null> {
+  // CM6 virtualizes long selections. Render the selected Markdown so offscreen
+  // lines are included instead of copying viewport spacer elements.
+  if (view.getMode() === 'source' && view.editor?.getSelection().trim()) {
+    return buildEditorMarkdownSource(plugin, view, true);
+  }
+  return buildDomSelectionSource(view, Platform.isMobile);
+}
+
 async function buildFileSource(plugin: ScreenshotSelectionPlugin, view: MarkdownView): Promise<CaptureSource | null> {
   if (Platform.isMobile) {
     // Prefer a clone of the LIVE rendered DOM (Reading view / Live Preview). iOS
@@ -376,6 +386,13 @@ async function buildFileSource(plugin: ScreenshotSelectionPlugin, view: Markdown
   const selectionSource = buildDomSelectionSource(view, Platform.isMobile, true);
   if (selectionSource) return selectionSource;
 
+  // Reading view only mounts a moving window of blocks. A whole-note capture
+  // must render the note, not clone that incomplete viewport and its spacers.
+  if (view.file) {
+    const markdown = await plugin.app.vault.cachedRead(view.file);
+    if (!markdown.trim()) return null;
+    return buildSnapshotSource(plugin, { markdown, sourcePath: view.file.path }, Platform.isMobile);
+  }
   return buildVisibleViewSource(view, Platform.isMobile);
 }
 
@@ -681,6 +698,19 @@ async function waitForAssets(root: HTMLElement): Promise<void> {
       ]);
     }),
   );
+}
+
+function removeCaptureScrollLayout(root: HTMLElement): void {
+  // Only change capture clones. These empty nodes represent unmounted content,
+  // not note spacing, and can otherwise add thousands of blank pixels.
+  root.querySelectorAll('.markdown-preview-pusher, .cm-gap').forEach((el) => el.remove());
+  root.querySelectorAll<HTMLElement>('.markdown-preview-sizer, .markdown-preview-section').forEach((el) => {
+    for (const [property, value] of Object.entries({
+      height: 'auto', 'min-height': '0', 'max-height': 'none',
+      'block-size': 'auto', 'min-block-size': '0', 'max-block-size': 'none',
+      padding: '0', margin: '0', overflow: 'visible',
+    })) el.style.setProperty(property, value, 'important');
+  });
 }
 
 function trimOffscreenToContent(offscreen: HTMLElement): void {
